@@ -1,11 +1,4 @@
 import os
-
-os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
-from torch.distributed._tensor import Shard, Replicate, distribute_tensor, DTensor
-import torch.distributed as dist
-from torch.distributed.device_mesh import init_device_mesh
-import torch
-
 import torch
 import os
 from torch import distributed as dist
@@ -13,12 +6,10 @@ import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
 # from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy
 from torch.distributed._composable.fsdp import fully_shard
-from torch.distributed.tensor.parallel import parallelize_module, ColwiseParallel, RowwiseParallel, SequenceParallel
+from torch.distributed.tensor.parallel import parallelize_module, ColwiseParallel, RowwiseParallel, SequenceParallel, PrepareModuleInput
+from torch.distributed._tensor import Shard, Replicate, distribute_tensor, DTensor
+
 from llama2_model import Transformer, ModelArgs
-from torch.distributed.tensor.parallel import (
-    PrepareModuleInput,
-    SequenceParallel,
-)
 
 
 # import warnings # ignore all warning messages
@@ -40,19 +31,7 @@ if device == 'cuda':
     torch.cuda.set_device(local_rank)
 
 
-class ToyModel(nn.Module):
-    def __init__(self):
-        super(ToyModel, self).__init__()
-        self.net1 = nn.Linear(8, 8, bias=False)
-        self.relu = nn.ReLU()
 
-        with torch.no_grad():
-            self.net1.weight = nn.Parameter(torch.arange(1., 65.).reshape(8,8))
-            print(self.net1.weight)
-    def forward(self, x):
-        return self.relu(x @ self.net1.weight.T)
-
-model = ToyModel()
 
 
 
@@ -159,12 +138,37 @@ mesh = init_device_mesh('cpu', (2,), mesh_dim_names=["TP"])
 # x = torch.randn(1, 8, 16)       # plain tensor
 # out = model.layers[0].attention_norm(x)
 
+class ToyModel(nn.Module):
+    def __init__(self):
+        super(ToyModel, self).__init__()
 
-x = torch.randn((4,8))
-y = torch.randn((4,8))
-x_local = distribute_tensor(x, device_mesh = mesh['TP'], placements=[Replicate()])
+        self.w1 = nn.Linear(2,4, bias=False)
+        self.w3 = nn.Linear(2,4, bias=False)
+        self.w2 = nn.Linear(4,2, bias=False)
 
-y_local = distribute_tensor(y, mesh['TP'], placements=[Shard(0)])
+        with torch.no_grad():
+            self.w1.weight = nn.Parameter(torch.arange(1., 9.).reshape(4,2)) # cause weight will have shape opposite of whats specified in nn.Linear()
+            self.w3.weight = nn.Parameter(torch.arange(9., 17.).reshape(4,2))
+            self.w2.weight = nn.Parameter(torch.tril(torch.ones(2,4), diagonal=-1))
 
-print(f'Y local {y_local} \n x_local {x_local @ y_local.T}')
+    def forward(self, x):
+        return self.w2(self.w1(x) * self.w3(x))
+
+model = ToyModel()
+
+tp_plan = {
+    "w1" : ColwiseParallel(),
+    "w2" : RowwiseParallel(),
+    "w3" : ColwiseParallel()
+}
+
+model = parallelize_module(model, mesh['TP'], tp_plan)
+x = distribute_tensor(torch.ones(3, 2), mesh['TP'], placements=[Replicate()]) # this is simply a tensor because ColwiseParallel will automatically convert it's input from torch.Tensor to torch.DTensor
+out = model(x)
+
+
+print(f'RANK {dist.get_rank()} w1.weight \n {model.w1.weight}, \n MM values \n{model.w1(x) * model.w3(x)} output values \n{out} \n')
+
+
+# print(f'RANK {dist.get_rank()} Y local {y_local} \n MM_local {x_local @ y_local.T}')
 # print(f'Global rank : {dist.get_rank()} \n\n WEIGGHT\n {model.net1.weight} \n OUTPUT\n {out}')
