@@ -3,6 +3,7 @@ import os
 import random
 import torch
 import asyncio
+import pickle
 from dataclasses import dataclass
 from torch import distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
@@ -325,7 +326,7 @@ class Rollout(Worker):
 
         if self.mesh['TP'].get_local_rank() ==0:
             # There's still a bug here, some tp groups have the same data.
-            data_list = split_data_list(data_list, mesh=self.rollout.mesh['DDP'])
+            data_list = split_data_list(data_list, mesh=self.mesh['DDP'])
 
             loop = asyncio.get_event_loop()
             outputs = loop.run_until_complete(
@@ -338,8 +339,11 @@ class Rollout(Worker):
 
         if self.mesh['TP'].get_local_rank() == 0:
             data_list, all_messages = map(list,zip(*outputs))
+
+            print(f'rank {dist.get_rank()} gglen {len(data_list)}')
+
             # gather all the data_list 
-            data_list = gather_data_list(data_list, self.rollout.mesh['DDP'])
+            data_list = gather_data_list(data_list, self.mesh['DDP'])
 
         if dist.get_rank() == 0:
             return data_list
@@ -393,7 +397,8 @@ def gather_data_list(data_list, mesh):
     dist.gather_object(data_list,lists, group_dst=0, group=mesh.get_group()) 
 
     #   print(f'rank {dist.get_rank()} got this list{lists}' )
-    return lists
+    
+    return sum(lists, []) if rank==0 else None # if not group destination, lists wil be None, won't sum
 
 
 
@@ -404,9 +409,10 @@ class Trainer:
         self.actor = Actor(config)
 
         check_mem_allocated(dist.get_rank(), 'before rollout')
-        self.rollout = Rollout(config)
 
-        check_mem_allocated(dist.get_rank(), 'after rollout')
+        # ------ turn it back on when needed ------
+        self.rollout = Rollout(config)
+        #  ------ turn it back on when needed ------
 
     def train(self):
         train_data = RLDataset(self.config.data_path, self.config.responses_per_prompt)
@@ -414,10 +420,26 @@ class Trainer:
         # construct train dataloader
         
         for data_list in train_dataloader:
-            print(f'rank {dist.get_rank()} lenght of data_list {len(data_list)}')
-            # let's do the rollout
+            # print(f'rank {dist.get_rank()} lenght of data_list {len(data_list)}')
+            # let's do the rollout --- turn it back on when doing real rollout ----
             data_list = self.rollout(data_list) # rank 0 will only have data_list, otherwise it'll be None
+            # let's do the rollout --- turn it back on when doing real rollout ----
 
+
+            check_mem_allocated(dist.get_rank(), 'after completing rollout')
+
+            # save the data_list to picke so that
+            if dist.get_rank == 0:
+
+                with open('data_list.pkl', 'wb') as f:
+                    pickle.dump(data_list, f)
+
+            if dist.get_rank == 0:
+
+                with open('data_list.pkl', 'rb') as f:
+                    data_list = pickle.load(f)
+
+            print(f'trn loop rank {dist.get_rank()} data_list length {len(data_list) if isinstance(data_list, list) else None}  \n\n' )
 
             break
             # generate rollouts. each train_batch will have length per_rollout_size x responses_per_prompt
@@ -436,8 +458,6 @@ def start():
     config = Config()
     ppo_trainer = Trainer(config)
     ppo_trainer.train()
-
-            
 
     return
 
