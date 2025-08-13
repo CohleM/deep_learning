@@ -95,6 +95,8 @@ def apply_rotary_emb(
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
     freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
+
+    print(f'RANK {dist.get_rank()}, \n xq \n {xq_}, freq cis \n {freqs_cis}')
     xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
     xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
     return xq_out.type_as(xq), xk_out.type_as(xk)
@@ -138,7 +140,7 @@ class RMSNorm(nn.Module):
 
         # print(f'global rank : {dist.get_rank()}\nINPUT:\n {x.shape}\n\n attn_norm_out \n {attn_norm_out.shape}')
         output = self._norm(x.float()).type_as(x)
-        print(f'global rank : {dist.get_rank()}\nINPUT:\n {x.shape}\n\n attn_norm_out \n {output.shape}')
+        # print(f'global rank : {dist.get_rank()}\nINPUT:\n {x.shape}\n\n attn_norm_out \n {output.shape}')
         return output * self.weight
 
     def reset_parameters(self):
