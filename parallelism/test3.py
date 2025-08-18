@@ -180,6 +180,7 @@ def prepare_llama_tp_layer(layer, device_mesh):
 
 
 def prepare_tp_model(model, mesh):
+    print('applying')
     for layer in model.model.layers:
         prepare_llama_tp_layer(layer, mesh['TP'])
 
@@ -208,6 +209,7 @@ def prepare_tp_model(model, mesh):
 
 def prepare_dp_model(model, mesh):
 
+    print('applying dp')
     def get_module_cls_from_name(name):
         for module in model.modules():
             if module.__class__.__name__ == name:
@@ -251,12 +253,9 @@ class Worker:
         
         # first make a device mesh
         fsdp_size = int(int(os.environ['WORLD_SIZE']) / (config.ddp_size * config.tp_size))
-        # this mesh will only be used for model partition
+        print('fsdp size', fsdp_size)
         self.mesh = init_device_mesh(device,(config.ddp_size,fsdp_size, config.tp_size), mesh_dim_names=["DDP", "FSDP", "TP"])
-        dp_size = int(int(os.environ['WORLD_SIZE']) / self.config.tp_size)
 
-        # this mesh will be used for data parallelism 
-        self.device_mesh = init_device_mesh(device,(dp_size, config.tp_size), mesh_dim_names=["DP", "TP"])
 
     def prepare_optimizer(self):
         if self.config.tp_size > 1:
@@ -266,7 +265,7 @@ class Worker:
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.config.lr)
 
         # offload the model to cpu
-        load_model_to_device(self, "cpu")
+        # load_model_to_device(self, "cpu")
 
 
 #         if dist.get_rank() == 0:
@@ -274,34 +273,11 @@ class Worker:
         
 
 
-def broadcast_data_list(data_list, mesh):
-
-    # First get the length right across the same tp group
-    if mesh.get_local_rank() == 0:
-        len_data_list = torch.tensor(len(data_list)).to('cuda')
-    else:
-        len_data_list = torch.tensor(0).to('cuda')
-    
-    dist.broadcast(len_data_list, group=mesh.get_group(), group_src=0)
-    
-#     print(len_data_list.item())
-
-    # then broadcast the same data_list across same tp group
-    if mesh.get_local_rank() != 0:
-        data_list = [None for _ in range(len_data_list)]
-    
-    dist.broadcast_object_list(data_list, group=mesh.get_group(), group_src=0)
-
-    return data_list
-
-
-
 class Rollout(Worker):
     def __init__(self, config):
         super().__init__(config)
 
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-        self.prepare_device_mesh()
         # init model using sglang
         self.prepare_env_var()
 
@@ -319,11 +295,7 @@ class Rollout(Worker):
         # very important to do dist.barrier() i.e block the code right here, otherwise some gpu will go on.
         dist.barrier()
 
-    def prepare_device_mesh(self):
-         
-        dp_size = int(int(os.environ['WORLD_SIZE']) / self.config.tp_size)
-        self.device_mesh = init_device_mesh("cuda", (dp_size, self.config.tp_size), mesh_dim_names=["DP", "TP"]) # device is on cpu cause we only need this mesh to scatter data (i.e for data parallelism)
-        
+
     async def rollout(self, data):
 
         messages,answer = data['messages'], data['answer']
@@ -381,9 +353,9 @@ class Rollout(Worker):
 
     def __call__(self, data_list):
 
-        if self.device_mesh['TP'].get_local_rank() ==0:
+        if self.mesh['TP'].get_local_rank() ==0:
             # There's still a bug here, some tp groups have the same data.
-            data_list = split_data_list(data_list, mesh=self.device_mesh['DP'])
+            data_list = split_data_list(data_list, mesh=self.mesh['DDP'])
 
             loop = asyncio.get_event_loop()
             outputs = loop.run_until_complete(
@@ -394,11 +366,13 @@ class Rollout(Worker):
             self.engine.release_memory_occupation()
         dist.barrier()
 
-        if self.device_mesh['TP'].get_local_rank() == 0:
+        if self.mesh['TP'].get_local_rank() == 0:
             data_list, all_messages = map(list,zip(*outputs))
 
+            print(f'rank {dist.get_rank()} gglen {len(data_list)}')
+
             # gather all the data_list 
-            data_list = gather_data_list(data_list, self.device_mesh['DP'])
+            data_list = gather_data_list(data_list, self.mesh['DDP'])
 
         if dist.get_rank() == 0:
             return data_list
@@ -415,7 +389,7 @@ class Rollout(Worker):
         # otherwise, SGL will use all the available cuda devices.
         cuda_visible_devices = [None] * self.config.tp_size
         dist.all_gather_object(
-            cuda_visible_devices, os.environ["LOCAL_RANK"], self.device_mesh["TP"].get_group()
+            cuda_visible_devices, os.environ["LOCAL_RANK"], self.mesh["TP"].get_group()
         )
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(cuda_visible_devices)
 
@@ -434,28 +408,12 @@ class Actor(Worker):
 
     # this func will only be used for old logprobs calculation so using torch.no_grad() 
     @torch.no_grad()
-    def compute_logprobs(self, data_list):
-        # let's first split the data_list again across groups
+    def compute_logprobs(self, data_list, mesh):
+        # let's first split the data_list again across ddp groups
+        data_list = split_data_list(data_list, mesh['DDP'])
 
-        # print(f'trn loop rank {dist.get_rank()} data_list length {len(data_list) if isinstance(data_list, list) else None} mesh {self.device_mesh} \n\n' )
-
-
-        if self.device_mesh['TP'].get_local_rank() == 0:
-            data_list = split_data_list(data_list, self.device_mesh['DP'])
-
-        data_list = broadcast_data_list(data_list, self.device_mesh['TP'])
-
-        # print(f'RANK {dist.get_rank()} len data_list , {len(data_list) if isinstance(data_list, list) else None} first element {data_list[0] if isinstance(data_list, list) else None}')
-        print(f'RANK {dist.get_rank()} len data_list , {len(data_list) if isinstance(data_list, list) else None} ')
-
-
-        # recplicate the data across tp dimension cause they need the same data 
-       
         # load the model back to gpu, previously the sharded model was stored in the CPU with it's reference contained in self.model
         load_model_to_device(self, torch.cuda.current_device())
-        print('loaded model to device')
-
-        logits = self.model()
 
         
 
@@ -473,41 +431,52 @@ class Trainer:
         #  ------ turn it back on when needed ------
 
     def train(self):
-        train_data = RLDataset(self.config.data_path, self.config.responses_per_prompt)
-        train_dataloader = StatefulDataLoader(train_data, batch_size=self.config.per_rollout_size, drop_last=True, collate_fn=train_data.collate_fn)
-        # construct train dataloader
+        # train_data = RLDataset(self.config.data_path, self.config.responses_per_prompt)
+        # train_dataloader = StatefulDataLoader(train_data, batch_size=self.config.per_rollout_size, drop_last=True, collate_fn=train_data.collate_fn)
+        # # construct train dataloader
         
-        for data_list in train_dataloader:
-            # print(f'rank {dist.get_rank()} lenght of data_list {len(data_list)}')
-            # let's do the rollout --- turn it back on when doing real rollout ----
-            # data_list = self.rollout(data_list) # rank 0 will only have data_list, otherwise it'll be None
-            # let's do the rollout --- turn it back on when doing real rollout ----
+        # for data_list in train_dataloader:
+        #     # print(f'rank {dist.get_rank()} lenght of data_list {len(data_list)}')
+        #     # let's do the rollout --- turn it back on when doing real rollout ----
+        #     # data_list = self.rollout(data_list) # rank 0 will only have data_list, otherwise it'll be None
+        #     # let's do the rollout --- turn it back on when doing real rollout ----
 
-            check_mem_allocated(dist.get_rank(), 'after completing rollout')
 
-            # save the data_list to picke so that
-            # if dist.get_rank() == 0:
+        #     check_mem_allocated(dist.get_rank(), 'after completing rollout')
 
-            #     with open('data_list.pkl', 'wb') as f:
-            #         pickle.dump(data_list, f)
+        #     # save the data_list to picke so that
+        #     # if dist.get_rank() == 0:
 
-            ## --- simulate rollout ---
-            data_list = None 
-            if dist.get_rank() == 0:
+        #     #     with open('data_list.pkl', 'wb') as f:
+        #     #         pickle.dump(data_list, f)
+
+        #     ## --- simulate rollout ---
+        #     data_list = None 
+        #     if dist.get_rank() == 0:
                  
-                with open('data_list.pkl', 'rb') as f:
-                    data_list = pickle.load(f)
+        #         with open('data_list.pkl', 'rb') as f:
+        #             data_list = pickle.load(f)
 
-            ## --- simulate rollout ---
-            # print(f'trn loop rank {dist.get_rank()} data_list length {len(data_list) if isinstance(data_list, list) else None}  \n\n' )
+        #     ## --- simulate rollout ---
+        #     print(f'trn loop rank {dist.get_rank()} data_list length {len(data_list) if isinstance(data_list, list) else None}  \n\n' )
+        x = torch.LongTensor(torch.randint(0,20000, (1,50))).to(torch.cuda.current_device()) # B,T
+            
+        pos_id = torch.arange(50).unsqueeze(0).to(torch.cuda.current_device())
+        
+        out = self.actor.model(input_ids=x, position_ids=pos_id, use_cache=False)
+        # out is logits of (2,50,vocab_size)
+        wq_weights = self.actor.model.model.layers[0].self_attn.q_proj.weight.to_local()
+        print(f'rank {dist.get_rank()} output : {out[0][0][:5] } model weights wq, {wq_weights.shape}')
+        # print(f'rank {dist.get_rank()}  model weights wq, {wq_weights[0][:5]}')
 
             # we've done the rollout, now let's generate the logprobs
-            self.actor.compute_logprobs(data_list)
 
-            break
+
+
+
+            # break
             # generate rollouts. each train_batch will have length per_rollout_size x responses_per_prompt
             # first scatter the data across each ddp group
-
 
 
 
