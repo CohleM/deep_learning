@@ -1,6 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # This software may be used and distributed according to the terms of the Llama 2 Community License Agreement.
-
+import torch.distributed as dist
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -447,7 +447,10 @@ class Transformer(nn.Module):
 
         """
         _bsz, seqlen = tokens.shape
+        
         h = self.tok_embeddings(tokens)
+
+        print(f'rank {dist.get_rank()} tokens is this {tokens} h {h}, h shape {h.shape} \n\n')
         self.freqs_cis = self.freqs_cis.to(h.device)
         freqs_cis = self.freqs_cis[0:seqlen]
 

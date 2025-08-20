@@ -4,6 +4,7 @@ import random
 import torch
 import asyncio
 import pickle
+import time
 from dataclasses import dataclass
 from torch import distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
@@ -327,54 +328,36 @@ class Rollout(Worker):
     async def rollout(self, data):
 
         messages,answer = data['messages'], data['answer']
+
         prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        states = self.tokenizer.encode(prompt)
+        actions = [0] * len(states)
+        action_mask = [0] * len(states)
+
         # print(ans)
         response = await self.engine.async_generate(
                 prompt
             )
         # response = sample_response
 
-        # generate reward
+        # generate sparse reward
         reward = random.randint(0,1)
-
         messages.append({'role': 'assistant', 'content': response['text']})
-        # Save list to a file
-        # with open("messages.pkl", "wb") as f:
-        #     pickle.dump(messages, f)
 
-        # # print("List saved successfully!")
+        tokenized_response = self.tokenizer.encode(response['text'])
+        states.extend(tokenized_response)
+        actions.extend(tokenized_response)
+        action_mask.extend([1] * len(tokenized_response))
 
-        # # Load list from the file
-        # with open("messages.pkl", "rb") as f:
-        #     messages = pickle.load(f)
+        # sparse reward, only provide to the last token, putting extra -1 here cause later we do states[:-1]
+        rewards = (len(states) -1 - 1)*[0] + [reward]
 
-        # let's find which tokens are states and which are actions
-        # and make an action mask.
-
-        states,actions, action_mask = [], [], []
-
-
-        for message in messages:
-            if message['role'] == 'assistant':
-                state = self.tokenizer.encode(message['content'], add_special_tokens=False)
-                action_mask.extend([1] * len(state))
-                actions.extend(state)
-            else:
-                #else if it's a question/prompt
-                prompt = self.tokenizer.apply_chat_template(message['content'], add_generation_prompt=True,tokenize=False)
-                state = self.tokenizer.encode(prompt, add_special_tokens=False)
-                action_mask.extend([0] * len(state))
-                actions.extend([0]* len(state))
-
-            states.extend(state)
-
-        # sparse reward, only provide to the last token
-        rewards = (len(states) - 1)*[0] + [reward]
 
         ex = {
-            'states' : torch.LongTensor(states),
-            'action_mask' : torch.LongTensor(action_mask),
-            'rewards' : torch.FloatTensor(rewards)
+            'states' : torch.LongTensor(states[:-1]),
+            'action_mask' : torch.LongTensor(action_mask[1:]),
+            'rewards' : torch.FloatTensor(rewards),
+            'actions' : torch.LongTensor(actions[1:])
         }
 
         return ex, messages
@@ -429,6 +412,7 @@ class Actor(Worker):
         # simple_llama2_config = ModelArgs(dim=4, n_layers=1, n_heads=4, vocab_size=8)
         # self.model = Transformer.from_model_args(simple_llama2_config).to(device)
         self.model = AutoModelForCausalLM.from_pretrained(config.model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model_name) 
         # actor will need optimizer
         self.prepare_optimizer()
 
@@ -455,9 +439,126 @@ class Actor(Worker):
         load_model_to_device(self, torch.cuda.current_device())
         print('loaded model to device')
 
-        logits = self.model()
+        input_ids = [item['states'] for item in data_list]
+        batch = {"input_ids": input_ids}
+        padded_input_ids = self.tokenizer.pad(batch, padding=True, padding_side='left') # make every row in the batch to have same length
 
+        # print(f'rank {dist.get_rank()} and  padded input ids shape {padded_input_ids['input_ids'].shape} attention mask shape {padded_input_ids['attention_mask'].shape} ')
+        attention_mask = padded_input_ids['attention_mask']
+        position_ids = attention_mask.long().cumsum(-1) - 1
+        position_ids.masked_fill_(attention_mask == 0, 1)
+
+        print(f'rank {dist.get_rank()} and  padded input ids shape {padded_input_ids['input_ids'].shape} attention mask shape {padded_input_ids['attention_mask'].shape} position ids shape, {position_ids.shape}\n\n ')
+        # print(f'rank {dist.get_rank()} position ids shape, ')
+
+
+        # test_input_ids = torch.randint(0,2000, (2,100))
+        # attention_mask = torch.ones_like(test_input_ids)
+        # position_ids = attention_mask.long().cumsum(-1) - 1
+        # position_ids.masked_fill_(attention_mask == 0, 1)
+        # logits = self.model(input_ids=test_input_ids,attention_mask=attention_mask, position_ids=position_ids , use_cache=False).logits
+        # print('this is logits shape', logits.shape)
+
+        logits = self.model(input_ids=padded_input_ids['input_ids'], attention_mask=padded_input_ids['attention_mask'], position_ids=position_ids , use_cache=False).logits
+
+        # reconstruct action mask from padded_input_ids
+        action_mask = torch.zeros_like(padded_input_ids)
+        for idx, item in enumerate(data_list):
+            len_actions = torch.sum(item['action_mask'])
+            action_mask[idx, -len_actions:] = 1
         
+        data_list['action_mask'] = action_mask
+        data_list['states'] = padded_input_ids
+
+        B,T, vocab_size = logits.shape
+        logsumexp = calc_logsumexp(logits, self.device_mesh)
+
+        action_logits = get_output_logits(logits.view(1, B*T, vocab_size), self.device_mesh).view(B,T)
+
+        logprobs = action_logits - logsumexp
+        data_list['old_logprobs'] = logprobs * data_list['action_mask']
+        
+        return data_list
+        # now find the respective logprobs
+        
+
+def calc_logsumexp(tensor, mesh):
+
+  step_size = 1024
+  logsumexps = []
+  for i in range(0,tensor.shape[1], step_size):
+    logsumexps.append(torch.logsumexp(tensor[:,i:i+step_size,:], dim=-1))
+
+  logsumexp = torch.cat(logsumexps, dim=-1)
+
+  logsumexps = [torch.zeros_like(logsumexp) for _ in range(mesh['TP'].size())]
+
+  dist.all_gather(logsumexps, logsumexp, mesh['TP'].get_group())
+
+  ## ----- uncomment when using GPU ----------
+  # logsumexps[device_mesh.get_local_rank()] = logsumexp # necessary to retain grad
+
+  logsumexps = torch.stack(logsumexps, dim=-1)
+  logsumexps = torch.logsumexp(logsumexps, dim=-1)
+
+
+  return logsumexps
+ 
+def differentiable_all_reduce(tensor, device_mesh):
+
+    detached_tensor = tensor.detach()
+    dist.all_reduce(
+        detached_tensor,
+        op=dist.ReduceOp.SUM,
+        group=device_mesh.get_group()
+    )
+    return tensor + detached_tensor - tensor.detach()
+
+def get_output_logits(logits, actions, mesh):
+  # logits must be 1,T,C actions must be 1,T
+
+  # each process will get its own logits shard.
+  # actions is the same.
+
+  # first we need to find which action belongs to which ranks.
+  device = 'cpu'
+  local_vocab_size = torch.LongTensor([logits.shape[-1]]).to(device)
+
+  gathered_vocab_sizes = [torch.zeros_like(local_vocab_size) for _ in range(mesh['TP'].size())]
+
+
+  print(local_vocab_size.dtype)
+  dist.all_gather(gathered_vocab_sizes, local_vocab_size, mesh['TP'].get_group())
+
+  cu_vocab_size = torch.cumsum(
+      torch.cat([torch.zeros_like(local_vocab_size)] + gathered_vocab_sizes), 0
+
+  )
+  # print(cu_vocab_size)
+
+  action_device_mapping = (actions < cu_vocab_size[1:].unsqueeze(dim=-1)).to(torch.float32).argmax(dim=0) # dimension -> 1, no_of_seq
+  # print(action_device_mapping)
+
+  # get rank's actions.
+  # now get which sequences belong to this rank
+  rank = mesh['TP'].get_local_rank()
+
+  # get the indices of non-zero elements
+  local_action_indices = torch.nonzero(action_device_mapping == rank, as_tuple=True)[0]
+  # print((local_action_indices))
+  local_actions = actions[:, local_action_indices] - cu_vocab_size[rank]
+
+  # logits is B,T,C. this T dimension is shared along all the local ranks, get only the logits for loca_action_indices
+  local_logits = logits[:, local_action_indices]
+
+  action_logits = torch.zeros(actions.shape)
+  action_logits[:,local_action_indices] = torch.gather(local_logits, -1, local_actions.unsqueeze(-1)).squeeze(-1)
+
+  # now this action_logits needs to be all reduced.
+
+  # return action_logits
+  return differentiable_all_reduce(action_logits, device_mesh=mesh['TP'])
+
 
 
 class Trainer:
@@ -485,7 +586,7 @@ class Trainer:
 
             check_mem_allocated(dist.get_rank(), 'after completing rollout')
 
-            # save the data_list to picke so that
+            # # save the data_list to picke so that
             # if dist.get_rank() == 0:
 
             #     with open('data_list.pkl', 'wb') as f:
@@ -502,7 +603,18 @@ class Trainer:
             # print(f'trn loop rank {dist.get_rank()} data_list length {len(data_list) if isinstance(data_list, list) else None}  \n\n' )
 
             # we've done the rollout, now let's generate the logprobs
-            self.actor.compute_logprobs(data_list)
+            data_list = self.actor.compute_logprobs(data_list)
+            # collect the data_list from all dp groups, each dp group src 0 will get whole data
+            data_list = gather_data_list(data_list, self.device_mesh['DP'])
+
+            print(f'trn loop rank {dist.get_rank()} data_list length {len(data_list) if isinstance(data_list, list) else None} mesh {self.device_mesh} \n\n' )
+            # now lets do the update.
+
+
+
+
+
+            # now the main ppo loss
 
             break
             # generate rollouts. each train_batch will have length per_rollout_size x responses_per_prompt
@@ -536,6 +648,7 @@ class Config:
     responses_per_prompt: int = 4
     per_rollout_size: int = 3
     offload_model: bool = True
+    updates_per_rollout: int = 3
 #     train_batch_size: int = 64
 #  
 def main():
