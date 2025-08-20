@@ -209,9 +209,15 @@ class Attention(nn.Module):
 
         """
         bsz, seqlen, _ = x.shape
+
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
+        # print(f'rank {dist.get_rank()}, xq {xq} xq.shape {xq.shape}, xq shape local')
+
         xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
+
+        print(f'rank {dist.get_rank()}, xq {xq} xq.shape {xq.shape}, xq shape local {xq.to_local().shape}')
+
         xk = xk.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_kv_heads, self.head_dim)
 
@@ -450,14 +456,17 @@ class Transformer(nn.Module):
         
         h = self.tok_embeddings(tokens)
 
-        print(f'rank {dist.get_rank()} tokens is this {tokens} h {h}, h shape {h.shape} \n\n')
+        # print(f'rank {dist.get_rank()} tokens is this {tokens} h {h}, h shape {h.shape} \n\n')
         self.freqs_cis = self.freqs_cis.to(h.device)
         freqs_cis = self.freqs_cis[0:seqlen]
 
         for layer in self.layers:
             h = layer(h, freqs_cis)
         h = self.norm(h)
+
         output = self.output(h).float()
+        
+        print(f'rank {dist.get_rank()}  h {h}, h shape {h.shape} output shape {output.shape} \n\n')
         return output
 
     @classmethod
