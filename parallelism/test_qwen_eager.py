@@ -22,29 +22,76 @@ from torch.distributed._tensor import DeviceMesh, Shard, Replicate, distribute_t
 from torch.distributed._composable.fsdp import fully_shard
 
 
+# def prepare_llama_tp_layer(layer, device_mesh):
+
+#     parallelize_plan = {
+#         "input_layernorm": SequenceParallel(),
+#         "self_attn" : PrepareModuleInput(
+#         input_kwarg_layouts = {"hidden_states" : Shard(1), "cos": Replicate(), "sin": Replicate(),"attention_mask" : Shard(1) },
+#         desired_input_kwarg_layouts = {"hidden_states" : Replicate(), "cos": Replicate(), "sin": Replicate(), "attention_mask": Replicate()}
+
+#     ),
+#         "self_attn.q_proj": ColwiseParallel(use_local_output=False),
+#         "self_attn.k_proj": ColwiseParallel(use_local_output=False),
+#         "self_attn.v_proj": ColwiseParallel(use_local_output=False),
+#         "self_attn.o_proj": RowwiseParallel(
+#             output_layouts=Shard(1)
+#         ),
+#         "post_attention_layernorm": SequenceParallel(),
+#         "mlp.gate_proj": ColwiseParallel(),
+#         "mlp.up_proj": ColwiseParallel(),
+#         "mlp.down_proj": RowwiseParallel(
+#             output_layouts=Shard(1)
+#         )
+#     }
+#     parallelize_module(
+#         module=layer,
+#         device_mesh=device_mesh,
+#         parallelize_plan=parallelize_plan
+#     )
+
+
+# def prepare_tp_model(model, mesh):
+#     for layer in model.model.layers:
+#         prepare_llama_tp_layer(layer, mesh['TP'])
+
+    
+# # ----- outer block --------
+#     parallelize_plan = {
+#         "model.embed_tokens": RowwiseParallel(
+#             input_layouts=Replicate(),
+#             output_layouts=Shard(1)
+#         ),
+#         "model.norm": SequenceParallel(),
+#         "lm_head": ColwiseParallel(input_layouts=(Shard(1))) # we are just specifying what it's current input layout is but internally it'll convert that Shard(1) to Replicate(), and the output will be Shard(-1)
+#     }
+#     parallelize_module(
+#         module=model,
+#         device_mesh=mesh['TP'],
+#         parallelize_plan=parallelize_plan
+#     )
+#     return model
+
 def prepare_llama_tp_layer(layer, device_mesh):
 
     parallelize_plan = {
-        "input_layernorm": SequenceParallel(),
-        # "rotary_emb" : PrepareModuleInput(
-        #     input_layouts = (Replicate(), Replicate()),
-        #     desired_input_layouts = (None, None)
-        # ),
-    #     "self_attn" : PrepareModuleInput(
-    #     input_layouts=(Shard(1), Replicate(), Replicate(), Replicate(), Replicate(), Replicate(), Replicate(), Replicate(), Replicate()),                             # Shard(1) is for hidden_dimension and None is for position_ids
-    #     desired_input_layouts=(Replicate(), Replicate(), Replicate(), Replicate(), Replicate(), Replicate(), Replicate(), Replicate(), Replicate()),
-    # ),
+        
+        "self_attn" : PrepareModuleInput(
+        input_kwarg_layouts = {"hidden_states" : Replicate(), "cos": Replicate(), "sin": Replicate(),"attention_mask" : Replicate() },
+        desired_input_kwarg_layouts = {"hidden_states" : Replicate(), "cos": Replicate(), "sin": Replicate(), "attention_mask": Replicate()}
+
+    ),
         "self_attn.q_proj": ColwiseParallel(use_local_output=False),
         "self_attn.k_proj": ColwiseParallel(use_local_output=False),
         "self_attn.v_proj": ColwiseParallel(use_local_output=False),
         "self_attn.o_proj": RowwiseParallel(
-            output_layouts=Shard(1)
+            # output_layouts=Shard(1)
         ),
-        "post_attention_layernorm": SequenceParallel(),
+        # "post_attention_layernorm": SequenceParallel(),
         "mlp.gate_proj": ColwiseParallel(),
         "mlp.up_proj": ColwiseParallel(),
         "mlp.down_proj": RowwiseParallel(
-            output_layouts=Shard(1)
+            # output_layouts=Shard(1)
         )
     }
     parallelize_module(
@@ -63,10 +110,10 @@ def prepare_tp_model(model, mesh):
     parallelize_plan = {
         "model.embed_tokens": RowwiseParallel(
             input_layouts=Replicate(),
-            output_layouts=Shard(1)
+            # output_layouts=Shard(1)
         ),
-        "model.norm": SequenceParallel(),
-        "lm_head": ColwiseParallel(input_layouts=(Shard(1))) # we are just specifying what it's current input layout is but internally it'll convert that Shard(1) to Replicate(), and the output will be Shard(-1)
+        # "model.norm": SequenceParallel(),
+        "lm_head": ColwiseParallel() # we are just specifying what it's current input layout is but internally it'll convert that Shard(1) to Replicate(), and the output will be Shard(-1)
     }
     parallelize_module(
         module=model,
@@ -175,7 +222,7 @@ def main():
         # Replace the forward method
         model.model.layers[0].self_attn.forward = debug_forward
     # In your main() function, add this before preparing the model:
-    model = AutoModelForCausalLM.from_pretrained(config.model_name).to('cuda')
+    model = AutoModelForCausalLM.from_pretrained(config.model_name, attn_implementation="eager").to('cuda')
     # debug_by_patching(model)
 
     # Debug inputs before tensor parallelism
@@ -210,16 +257,18 @@ def main():
     # print(f' rank {dist.get_rank()} embed_tokens shape {model.model.embed_tokens.weight.to_local().shape} {model.model.embed_tokens.weight}')
 
     torch.manual_seed(42)
-    x = torch.randint(0,6, (1,4)).to('cuda')
+    x = torch.randint(0,6, (2,6)).to('cuda')
     # x = torch.arange(0,50).reshape(1,50).to('cuda')
     # x = torch.LongTensor([[0,3,1,2]]).to('cuda')
     attention_mask = torch.ones_like(x).to('cuda')
-    attention_mask[0, :2] = 0
+    attention_mask[1, :2] = 0
+    attention_mask = attention_mask.to('cuda')
+    print('this is attention_mask', attention_mask)
     position_ids = attention_mask.long().cumsum(-1) - 1
     position_ids.masked_fill_(attention_mask == 0, 0).to('cuda')
     # print(f' rank {dist.get_rank()} tok embeeddings {model.tok_embeddings.weight} {model.tok_embeddings.weight.to_local().shape}')
     
-    out = model(input_ids=x)
+    out = model(input_ids=x, position_ids=position_ids, attention_mask=attention_mask)
 
     print(f'rank {dist.get_rank()} , out shape, {out.logits.shape}')
 
