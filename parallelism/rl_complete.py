@@ -198,7 +198,7 @@ def prepare_tp_model(model, mesh):
             # output_layouts=Shard(1)
         ),
         # "model.norm": SequenceParallel(),
-        "lm_head": ColwiseParallel(output_layouts=Replicate()) # we are just specifying what it's current input layout is but internally it'll convert that Shard(1) to Replicate(), and the output will be Shard(-1)
+        "lm_head": ColwiseParallel() # we are just specifying what it's current input layout is but internally it'll convert that Shard(1) to Replicate(), and the output will be Shard(-1)
     }
     parallelize_module(
         module=model,
@@ -410,84 +410,7 @@ class Rollout(Worker):
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(cuda_visible_devices)
 
 
-class Actor(Worker):
-    def __init__(self, config):
-        super().__init__(config)
-        device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        #         define model from huggingface later on
-        # simple_llama2_config = ModelArgs(dim=4, n_layers=1, n_heads=4, vocab_size=8)
-        # self.model = Transformer.from_model_args(simple_llama2_config).to(device)
-        self.model = AutoModelForCausalLM.from_pretrained(config.model_name, attn_implementation="eager").to(device)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model_name) 
-        # actor will need optimizer
-        self.prepare_optimizer()
-
-    # this func will only be used for old logprobs calculation so using torch.no_grad() 
-    @torch.no_grad()
-    def compute_logprobs(self, data_list):
-        # let's first split the data_list again across groups
-
-        # print(f'trn loop rank {dist.get_rank()} data_list length {len(data_list) if isinstance(data_list, list) else None} mesh {self.device_mesh} \n\n' )
-
-
-        if self.device_mesh['TP'].get_local_rank() == 0:
-            data_list = split_data_list(data_list, self.device_mesh['DP'])
-
-        data_list = broadcast_data_list(data_list, self.device_mesh['TP'])
-
-        # print(f'RANK {dist.get_rank()} len data_list , {len(data_list) if isinstance(data_list, list) else None} first element {data_list[0] if isinstance(data_list, list) else None}')
-        print(f'RANK {dist.get_rank()} len data_list , {len(data_list) if isinstance(data_list, list) else None} ')
-
-
-        # recplicate the data across tp dimension cause they need the same data 
-       
-        # load the model back to gpu, previously the sharded model was stored in the CPU with it's reference contained in self.model
-        load_model_to_device(self, torch.cuda.current_device())
-        print('loaded model to device')
-
-        input_ids = [item['states'] for item in data_list]
-        batch = {"input_ids": input_ids}
-        padded_input_ids = self.tokenizer.pad(batch, padding=True, padding_side='left') # make every row in the batch to have same length
-
-        # print(f'rank {dist.get_rank()} and  padded input ids shape {padded_input_ids['input_ids'].shape} attention mask shape {padded_input_ids['attention_mask'].shape} ')
-        attention_mask = padded_input_ids['attention_mask']
-        position_ids = attention_mask.long().cumsum(-1) - 1
-        position_ids.masked_fill_(attention_mask == 0, 0)
-
-        # print(f'rank {dist.get_rank()} and  padded input ids shape {padded_input_ids['input_ids'].shape} attention mask shape {padded_input_ids['attention_mask'].shape} position ids shape, {position_ids.shape}\n\n ')
-        # print(f'rank {dist.get_rank()} position ids shape, ')
-
-
-        # test_input_ids = torch.randint(0,2000, (2,100))
-        # attention_mask = torch.ones_like(test_input_ids)
-        # position_ids = attention_mask.long().cumsum(-1) - 1
-        # position_ids.masked_fill_(attention_mask == 0, 1)
-        # logits = self.model(input_ids=test_input_ids,attention_mask=attention_mask, position_ids=position_ids , use_cache=False).logits
-        # print('this is logits shape', logits.shape)
-
-        logits = self.model(input_ids=padded_input_ids['input_ids'], attention_mask=attention_mask, position_ids=position_ids).logits
-
-        print(f' rank {dist.get_rank()} logits {logits.shape}')
-        # # reconstruct action mask from padded_input_ids
-        # action_mask = torch.zeros_like(padded_input_ids)
-        # for idx, item in enumerate(data_list):
-        #     len_actions = torch.sum(item['action_mask'])
-        #     action_mask[idx, -len_actions:] = 1
-        
-        # data_list['action_mask'] = action_mask
-        # data_list['states'] = padded_input_ids
-
-        # B,T, vocab_size = logits.shape
-        # logsumexp = calc_logsumexp(logits, self.device_mesh)
-
-        # action_logits = get_output_logits(logits.view(1, B*T, vocab_size), self.device_mesh).view(B,T)
-
-        # logprobs = action_logits - logsumexp
-        # data_list['old_logprobs'] = logprobs * data_list['action_mask']
-        
-        return data_list
-        # now find the respective logprobs
         
 
 def calc_logsumexp(tensor, mesh):
@@ -529,7 +452,7 @@ def get_output_logits(logits, actions, mesh):
   # actions is the same.
 
   # first we need to find which action belongs to which ranks.
-  device = 'cpu'
+  device = 'cuda' if torch.cuda.is_available() else 'cpu'
   local_vocab_size = torch.LongTensor([logits.shape[-1]]).to(device)
 
   gathered_vocab_sizes = [torch.zeros_like(local_vocab_size) for _ in range(mesh['TP'].size())]
@@ -559,7 +482,8 @@ def get_output_logits(logits, actions, mesh):
   # logits is B,T,C. this T dimension is shared along all the local ranks, get only the logits for loca_action_indices
   local_logits = logits[:, local_action_indices]
 
-  action_logits = torch.zeros(actions.shape)
+  action_logits = torch.zeros(actions.shape, device=torch.cuda.current_device()).type_as(local_logits)
+  print('action logits dtype', action_logits.dtype)
   action_logits[:,local_action_indices] = torch.gather(local_logits, -1, local_actions.unsqueeze(-1)).squeeze(-1)
 
   # now this action_logits needs to be all reduced.
@@ -578,7 +502,7 @@ class Trainer:
         check_mem_allocated(dist.get_rank(), 'after actor rollout')
 
         # ------ turn it back on when needed ------
-        self.rollout = Rollout(config)
+        # self.rollout = Rollout(config)
         #  ------ turn it back on when needed ------
 
     def train(self):
@@ -589,16 +513,16 @@ class Trainer:
         for data_list in train_dataloader:
             # print(f'rank {dist.get_rank()} lenght of data_list {len(data_list)}')
             # let's do the rollout --- turn it back on when doing real rollout ----
-            data_list = self.rollout(data_list) # rank 0 will only have data_list, otherwise it'll be None
+            # data_list = self.rollout(data_list) # rank 0 will only have data_list, otherwise it'll be None
             # let's do the rollout --- turn it back on when doing real rollout ----
 
             check_mem_allocated(dist.get_rank(), 'after completing rollout')
 
             # save the data_list to picke so that
-            if dist.get_rank() == 0:
+            # if dist.get_rank() == 0:
 
-                with open('data_list.pkl', 'wb') as f:
-                    pickle.dump(data_list, f)
+            #     with open('data_list.pkl', 'wb') as f:
+            #         pickle.dump(data_list, f)
 
             ## --- simulate rollout ---
             data_list = None 
@@ -607,15 +531,15 @@ class Trainer:
                 with open('data_list.pkl', 'rb') as f:
                     data_list = pickle.load(f)
 
-            ## --- simulate rollout ---
+            # --- simulate rollout ---
             # print(f'trn loop rank {dist.get_rank()} data_list length {len(data_list) if isinstance(data_list, list) else None}  \n\n' )
 
             # we've done the rollout, now let's generate the logprobs
             data_list = self.actor.compute_logprobs(data_list)
             # collect the data_list from all dp groups, each dp group src 0 will get whole data
-            data_list = gather_data_list(data_list, self.device_mesh['DP'])
+            data_list = gather_data_list(data_list, self.actor.device_mesh['DP'])
 
-            print(f'trn loop rank {dist.get_rank()} data_list length {len(data_list) if isinstance(data_list, list) else None} mesh {self.device_mesh} \n\n' )
+            print(f'trn loop rank {dist.get_rank()} data_list length {len(data_list) if isinstance(data_list, list) else None} mesh {self.actor.device_mesh} \n\n' )
             # now lets do the update.
 
 
@@ -635,6 +559,95 @@ def check_mem_allocated(rank, msg):
     ans = torch.cuda.memory_allocated() / (1024**3)
     print(f'RANK {rank} MEMORY_ALLOCATED {msg} {ans}')
 
+class Actor(Worker):
+    def __init__(self, config):
+        super().__init__(config)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        #         define model from huggingface later on
+        # simple_llama2_config = ModelArgs(dim=4, n_layers=1, n_heads=4, vocab_size=8)
+        # self.model = Transformer.from_model_args(simple_llama2_config).to(device)
+        self.model = AutoModelForCausalLM.from_pretrained(config.model_name, attn_implementation="eager").to(device)
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model_name) 
+        # actor will need optimizer
+        self.prepare_optimizer()
+
+    # this func will only be used for old logprobs calculation so using torch.no_grad() 
+    @torch.no_grad()
+    def compute_logprobs(self, data_list):
+        # let's first split the data_list again across groups
+
+        # print(f'trn loop rank {dist.get_rank()} data_list length {len(data_list) if isinstance(data_list, list) else None} mesh {self.device_mesh} \n\n' )
+
+
+        if self.device_mesh['TP'].get_local_rank() == 0:
+            data_list = split_data_list(data_list, self.device_mesh['DP'])
+
+        data_list = broadcast_data_list(data_list, self.device_mesh['TP'])
+
+        # print(f'RANK {dist.get_rank()} len data_list , {len(data_list) if isinstance(data_list, list) else None} first element {data_list[0] if isinstance(data_list, list) else None}')
+        print(f'RANK {dist.get_rank()} len data_list , {len(data_list) if isinstance(data_list, list) else None} ')
+
+
+        # recplicate the data across tp dimension cause they need the same data 
+       
+        # load the model back to gpu, previously the sharded model was stored in the CPU with it's reference contained in self.model
+        load_model_to_device(self, torch.cuda.current_device())
+        print('loaded model to device')
+
+        input_ids = [item['states'] for item in data_list]
+        action_input_ids = [item['actions'] for item in data_list]
+
+        batch = {"input_ids": input_ids}
+        action_batch = {"input_ids": action_input_ids}
+        
+        padded_input_ids = self.tokenizer.pad(batch, padding=True, padding_side='left') # make every row in the batch to have same length
+        action_input_ids = self.tokenizer.pad(action_batch, padding=True, padding_side='left')['input_ids'].to('cuda')
+
+        # print(f'rank {dist.get_rank()} and  padded input ids shape {padded_input_ids['input_ids'].shape} attention mask shape {padded_input_ids['attention_mask'].shape} ')
+        attention_mask = padded_input_ids['attention_mask']
+        position_ids = attention_mask.long().cumsum(-1) - 1
+        position_ids.masked_fill_(attention_mask == 0, 0)
+
+        # print(f'rank {dist.get_rank()} and  padded input ids shape {padded_input_ids['input_ids'].shape} attention mask shape {padded_input_ids['attention_mask'].shape} position ids shape, {position_ids.shape}\n\n ')
+        # print(f'rank {dist.get_rank()} position ids shape, ')
+
+
+        # test_input_ids = torch.randint(0,2000, (2,100))
+        # attention_mask = torch.ones_like(test_input_ids)
+        # position_ids = attention_mask.long().cumsum(-1) - 1
+        # position_ids.masked_fill_(attention_mask == 0, 1)
+        # logits = self.model(input_ids=test_input_ids,attention_mask=attention_mask, position_ids=position_ids , use_cache=False).logits
+        # print('this is logits shape', logits.shape)
+
+        logits = self.model(input_ids=padded_input_ids['input_ids'], attention_mask=attention_mask, position_ids=position_ids).logits
+        dist.barrier()
+
+        print(f' rank {dist.get_rank()} logits {logits.shape}')
+        # reconstruct action mask from padded_input_ids
+        action_mask = torch.zeros_like(padded_input_ids['input_ids']).to(torch.cuda.current_device())
+        for idx, item in enumerate(data_list):
+            len_actions = torch.sum(item['action_mask'])
+            action_mask[idx, -len_actions:] = 1
+            item['action_mask'] = action_mask[idx, :]
+        
+        # data_list['action_mask'] = action_mask
+        # data_list['states'] = padded_input_ids
+
+        B,T, vocab_size = logits.shape
+        logsumexp = calc_logsumexp(logits, self.device_mesh)
+
+        action_logits = get_output_logits(logits.view(1, B*T, vocab_size), action_input_ids.view(1,B*T), self.device_mesh).view(B,T)
+
+        logprobs = action_logits - logsumexp
+
+        for idx in range(logprobs.shape[0]):
+            data_list[idx]['old_logprobs'] = logprobs[idx, :] * data_list[idx]['action_mask']
+
+        # data_list['old_logprobs'] = logprobs * data_list['action_mask']
+        
+        return data_list
+        # now find the respective logprobs
 
 def start():
     # nest_asyncio.apply()
