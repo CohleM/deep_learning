@@ -323,20 +323,17 @@ def main():
     B,T = input_ids.shape
 
     y = torch.randint(0,100, (input_ids.shape[0], input_ids.shape[1])).to('cuda')
-    y_new = y[1:, :]
+    y_new = y[0:1, -4:]
     out = model(input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask).logits
 
     cross_entorpy = torch.nn.CrossEntropyLoss(reduction='none')
-    loss = cross_entorpy(out.view(B*T, -1), y.view(B*T)).view(B,T).mean(dim=-1)
+    loss = (cross_entorpy(out.view(B*T, -1), y.view(B*T)).view(B,T) * attention_mask).sum(dim=-1)/(attention_mask.sum(dim=-1))
     # print(f'rank {dist.get_rank()} , out shape, {out.shape}')
 
     # ------- new model ---------
     new_model = AutoModelForCausalLM.from_pretrained(config.model_name, attn_implementation="eager").to('cuda') 
 
-
-    
-
-    batch = {'input_ids': [sent2]} 
+    batch = {'input_ids': [sent1]} 
     padded_input_ids = tokenizer.pad(batch, padding=True, padding_side='left')
 
     input_ids, attention_mask = torch.tensor(padded_input_ids['input_ids']).to('cuda'), torch.tensor(padded_input_ids['attention_mask']).to('cuda')
@@ -345,7 +342,7 @@ def main():
 
     B,T = input_ids.shape
  
-    new_out = new_model(input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask).logits
+    new_out = new_model(input_ids=input_ids).logits
 
     new_loss = cross_entorpy(new_out.view(B*T, -1), y_new.view(B*T)).view(B,T).mean(dim=-1)
 

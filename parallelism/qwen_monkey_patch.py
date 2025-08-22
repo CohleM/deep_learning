@@ -4,7 +4,7 @@ import transformers.models.qwen2.modeling_qwen2 as qwen_module
 from transformers.cache_utils import Cache
 from transformers.processing_utils import Unpack
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 def patch_qwen_attention():
     """Monkey-patch Qwen2Attention to accept cos/sin as separate tensors"""

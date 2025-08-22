@@ -5,6 +5,7 @@ import torch
 import asyncio
 import pickle
 import time
+from qwen_monkey_patch import apply_qwen_patches
 from dataclasses import dataclass
 from torch import distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
@@ -159,18 +160,23 @@ def setup():
 def prepare_llama_tp_layer(layer, device_mesh):
 
     parallelize_plan = {
-        "input_layernorm": SequenceParallel(),
-        "self_attn.q_proj": ColwiseParallel(),
-        "self_attn.k_proj": ColwiseParallel(),
-        "self_attn.v_proj": ColwiseParallel(),
+        
+        "self_attn" : PrepareModuleInput(
+        input_kwarg_layouts = {"hidden_states" : Replicate(), "cos": Replicate(), "sin": Replicate(),"attention_mask" : Replicate() },
+        desired_input_kwarg_layouts = {"hidden_states" : Replicate(), "cos": Replicate(), "sin": Replicate(), "attention_mask": Replicate()}
+
+    ),
+        "self_attn.q_proj": ColwiseParallel(use_local_output=False),
+        "self_attn.k_proj": ColwiseParallel(use_local_output=False),
+        "self_attn.v_proj": ColwiseParallel(use_local_output=False),
         "self_attn.o_proj": RowwiseParallel(
-            output_layouts=Shard(1)
+            # output_layouts=Shard(1)
         ),
-        "post_attention_layernorm": SequenceParallel(),
+        # "post_attention_layernorm": SequenceParallel(),
         "mlp.gate_proj": ColwiseParallel(),
         "mlp.up_proj": ColwiseParallel(),
         "mlp.down_proj": RowwiseParallel(
-            output_layouts=Shard(1)
+            # output_layouts=Shard(1)
         )
     }
     parallelize_module(
@@ -187,11 +193,12 @@ def prepare_tp_model(model, mesh):
     
 # ----- outer block --------
     parallelize_plan = {
-        "model.embed_tokens": ColwiseParallel(
-            output_layouts=Shard(1)
+        "model.embed_tokens": RowwiseParallel(
+            input_layouts=Replicate(),
+            # output_layouts=Shard(1)
         ),
-        "model.norm": SequenceParallel(),
-        "lm_head": ColwiseParallel()
+        # "model.norm": SequenceParallel(),
+        "lm_head": ColwiseParallel(output_layouts=Replicate()) # we are just specifying what it's current input layout is but internally it'll convert that Shard(1) to Replicate(), and the output will be Shard(-1)
     }
     parallelize_module(
         module=model,
@@ -411,7 +418,7 @@ class Actor(Worker):
         #         define model from huggingface later on
         # simple_llama2_config = ModelArgs(dim=4, n_layers=1, n_heads=4, vocab_size=8)
         # self.model = Transformer.from_model_args(simple_llama2_config).to(device)
-        self.model = AutoModelForCausalLM.from_pretrained(config.model_name)
+        self.model = AutoModelForCausalLM.from_pretrained(config.model_name, attn_implementation="eager").to(device)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_name) 
         # actor will need optimizer
         self.prepare_optimizer()
@@ -446,9 +453,9 @@ class Actor(Worker):
         # print(f'rank {dist.get_rank()} and  padded input ids shape {padded_input_ids['input_ids'].shape} attention mask shape {padded_input_ids['attention_mask'].shape} ')
         attention_mask = padded_input_ids['attention_mask']
         position_ids = attention_mask.long().cumsum(-1) - 1
-        position_ids.masked_fill_(attention_mask == 0, 1)
+        position_ids.masked_fill_(attention_mask == 0, 0)
 
-        print(f'rank {dist.get_rank()} and  padded input ids shape {padded_input_ids['input_ids'].shape} attention mask shape {padded_input_ids['attention_mask'].shape} position ids shape, {position_ids.shape}\n\n ')
+        # print(f'rank {dist.get_rank()} and  padded input ids shape {padded_input_ids['input_ids'].shape} attention mask shape {padded_input_ids['attention_mask'].shape} position ids shape, {position_ids.shape}\n\n ')
         # print(f'rank {dist.get_rank()} position ids shape, ')
 
 
@@ -459,24 +466,25 @@ class Actor(Worker):
         # logits = self.model(input_ids=test_input_ids,attention_mask=attention_mask, position_ids=position_ids , use_cache=False).logits
         # print('this is logits shape', logits.shape)
 
-        logits = self.model(input_ids=padded_input_ids['input_ids'], attention_mask=padded_input_ids['attention_mask'], position_ids=position_ids , use_cache=False).logits
+        logits = self.model(input_ids=padded_input_ids['input_ids'], attention_mask=attention_mask, position_ids=position_ids).logits
 
-        # reconstruct action mask from padded_input_ids
-        action_mask = torch.zeros_like(padded_input_ids)
-        for idx, item in enumerate(data_list):
-            len_actions = torch.sum(item['action_mask'])
-            action_mask[idx, -len_actions:] = 1
+        print(f' rank {dist.get_rank()} logits {logits.shape}')
+        # # reconstruct action mask from padded_input_ids
+        # action_mask = torch.zeros_like(padded_input_ids)
+        # for idx, item in enumerate(data_list):
+        #     len_actions = torch.sum(item['action_mask'])
+        #     action_mask[idx, -len_actions:] = 1
         
-        data_list['action_mask'] = action_mask
-        data_list['states'] = padded_input_ids
+        # data_list['action_mask'] = action_mask
+        # data_list['states'] = padded_input_ids
 
-        B,T, vocab_size = logits.shape
-        logsumexp = calc_logsumexp(logits, self.device_mesh)
+        # B,T, vocab_size = logits.shape
+        # logsumexp = calc_logsumexp(logits, self.device_mesh)
 
-        action_logits = get_output_logits(logits.view(1, B*T, vocab_size), self.device_mesh).view(B,T)
+        # action_logits = get_output_logits(logits.view(1, B*T, vocab_size), self.device_mesh).view(B,T)
 
-        logprobs = action_logits - logsumexp
-        data_list['old_logprobs'] = logprobs * data_list['action_mask']
+        # logprobs = action_logits - logsumexp
+        # data_list['old_logprobs'] = logprobs * data_list['action_mask']
         
         return data_list
         # now find the respective logprobs
@@ -570,7 +578,7 @@ class Trainer:
         check_mem_allocated(dist.get_rank(), 'after actor rollout')
 
         # ------ turn it back on when needed ------
-        # self.rollout = Rollout(config)
+        self.rollout = Rollout(config)
         #  ------ turn it back on when needed ------
 
     def train(self):
@@ -581,16 +589,16 @@ class Trainer:
         for data_list in train_dataloader:
             # print(f'rank {dist.get_rank()} lenght of data_list {len(data_list)}')
             # let's do the rollout --- turn it back on when doing real rollout ----
-            # data_list = self.rollout(data_list) # rank 0 will only have data_list, otherwise it'll be None
+            data_list = self.rollout(data_list) # rank 0 will only have data_list, otherwise it'll be None
             # let's do the rollout --- turn it back on when doing real rollout ----
 
             check_mem_allocated(dist.get_rank(), 'after completing rollout')
 
-            # # save the data_list to picke so that
-            # if dist.get_rank() == 0:
+            # save the data_list to picke so that
+            if dist.get_rank() == 0:
 
-            #     with open('data_list.pkl', 'wb') as f:
-            #         pickle.dump(data_list, f)
+                with open('data_list.pkl', 'wb') as f:
+                    pickle.dump(data_list, f)
 
             ## --- simulate rollout ---
             data_list = None 
@@ -631,6 +639,7 @@ def check_mem_allocated(rank, msg):
 def start():
     # nest_asyncio.apply()
     config = Config()
+    apply_qwen_patches()
     ppo_trainer = Trainer(config)
     ppo_trainer.train()
 
@@ -645,7 +654,7 @@ class Config:
     tp_size: int = 2 
     lr: float = 1e-6
     data_path: str = 'CohleM/olympiad_small'
-    responses_per_prompt: int = 4
+    responses_per_prompt: int = 2 
     per_rollout_size: int = 3
     offload_model: bool = True
     updates_per_rollout: int = 3
