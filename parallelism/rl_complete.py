@@ -534,12 +534,46 @@ class Trainer:
             # --- simulate rollout ---
             # print(f'trn loop rank {dist.get_rank()} data_list length {len(data_list) if isinstance(data_list, list) else None}  \n\n' )
 
-            # we've done the rollout, now let's generate the logprobs
-            data_list = self.actor.compute_logprobs(data_list)
-            # collect the data_list from all dp groups, each dp group src 0 will get whole data
-            data_list = gather_data_list(data_list, self.actor.device_mesh['DP'])
+            # ------ calculate the advantage ------
+            if dist.get_rank() == 0:
+                data_list = grpo_advantage(data_list, self.config.responses_per_prompt)
+            # ------ calculate the advantage ------
 
-            print(f'trn loop rank {dist.get_rank()} data_list length {len(data_list) if isinstance(data_list, list) else None} mesh {self.actor.device_mesh} \n\n' )
+            ## ---- old logprobs section ------
+            # we've done the rollout, now let's generate the logprobs
+
+            # since global rank 0 has the data, pass it to its other dp group members
+            if self.actor.device_mesh['TP'].get_local_rank() == 0:
+                data_list = split_data_list(data_list, self.actor.device_mesh['DP'])
+            
+            # for tp groups data must be same, so make same data
+            data_list = broadcast_data_list(data_list, self.actor.device_mesh['TP'])
+            
+            with torch.no_grad():
+                data_list = self.actor.compute_logprobs(data_list, log_type='old')
+
+            # collect the data_list from all dp groups, each dp group src 0 will get whole data, if we need to later divide the data, then why gather here, pointless right now
+            # data_list = gather_data_list(data_list, self.actor.device_mesh['DP'])
+
+            ## ----- old logprobs section -----
+            # divide the data_list into minibatches, each of size, i.e total_rollout_data_in_this_rank / updates_per_rollout
+            mini_batch_size = len(data_list) // self.config.updates_per_rollout
+
+            data_list = [data_list[i*mini_batch_size: (i+1)*mini_batch_size] for i in range(len(data_list))]
+
+            # for minibatch in data_list:
+            #     mini_batch_data_list = self.actor.compute_logprobs(minibatch, log_type="current")
+            #     loss = self.actor.compute_ppo_loss(mini_batch_data_list)
+            #     # then find the ppo loss.
+            #     # do loss.backward()
+            #     # then do optimizer.step()
+            #     self.actor.optimizer.step()
+
+            ## ------- actor update section -------
+
+            ## ------- actor update section -------
+
+            print(f'trn loop rank {dist.get_rank()} data_list length {len(data_list) if isinstance(data_list, list) else None} mesh {self.actor.device_mesh} datalist: {len(data_list[0])} \n\n' )
             # now lets do the update.
 
 
@@ -553,6 +587,17 @@ class Trainer:
             # first scatter the data across each ddp group
 
 
+def grpo_advantage(data_list, responses_per_prompt):
+  rewards = torch.tensor([ex['rewards'].sum() for ex in data_list]).view(-1, responses_per_prompt)
+  baseline = rewards.mean(-1)
+  std = rewards.std(-1)
+  advantages = (rewards - baseline.unsqueeze(-1))/ (std.unsqueeze(-1) + torch.finfo(rewards.dtype).eps)
+  # advantages = advantages.flatten()
+
+  for ex, advantage in zip(data_list, advantages.flatten()):
+    ex['advantage'] = advantage * ex['action_mask']
+
+  return data_list
 
 
 def check_mem_allocated(rank, msg):
@@ -573,17 +618,8 @@ class Actor(Worker):
         self.prepare_optimizer()
 
     # this func will only be used for old logprobs calculation so using torch.no_grad() 
-    @torch.no_grad()
-    def compute_logprobs(self, data_list):
+    def compute_logprobs(self, data_list, log_type):
         # let's first split the data_list again across groups
-
-        # print(f'trn loop rank {dist.get_rank()} data_list length {len(data_list) if isinstance(data_list, list) else None} mesh {self.device_mesh} \n\n' )
-
-
-        if self.device_mesh['TP'].get_local_rank() == 0:
-            data_list = split_data_list(data_list, self.device_mesh['DP'])
-
-        data_list = broadcast_data_list(data_list, self.device_mesh['TP'])
 
         # print(f'RANK {dist.get_rank()} len data_list , {len(data_list) if isinstance(data_list, list) else None} first element {data_list[0] if isinstance(data_list, list) else None}')
         print(f'RANK {dist.get_rank()} len data_list , {len(data_list) if isinstance(data_list, list) else None} ')
@@ -625,12 +661,14 @@ class Actor(Worker):
 
         print(f' rank {dist.get_rank()} logits {logits.shape}')
         # reconstruct action mask from padded_input_ids
-        action_mask = torch.zeros_like(padded_input_ids['input_ids']).to(torch.cuda.current_device())
-        for idx, item in enumerate(data_list):
-            len_actions = torch.sum(item['action_mask'])
-            action_mask[idx, -len_actions:] = 1
-            item['action_mask'] = action_mask[idx, :]
-        
+
+        # if log_type=='old': # only update the action mask once, cause this function will be executed for calculating current logprobs
+        #     action_mask = torch.zeros_like(padded_input_ids['input_ids']).to(torch.cuda.current_device())
+        #     for idx, item in enumerate(data_list):
+        #         len_actions = torch.sum(item['action_mask'])
+        #         action_mask[idx, -len_actions:] = 1
+        #         item['action_mask'] = action_mask[idx, :]
+            
         # data_list['action_mask'] = action_mask
         # data_list['states'] = padded_input_ids
 
@@ -642,8 +680,9 @@ class Actor(Worker):
         logprobs = action_logits - logsumexp
 
         for idx in range(logprobs.shape[0]):
-            data_list[idx]['old_logprobs'] = logprobs[idx, :] * data_list[idx]['action_mask']
-
+            # get the logprobs for only the right side of logprobs that is equals to the actions length, cause left side has been padded to match max length
+            data_list[idx][f'{log_type}_logprobs'] = logprobs[idx, -len(data_list[idx]['actions']):] # now oldlogprobs and actions will have the same length as actions and action_mask
+            print( len(data_list[idx][f'{log_type}_logprobs']) == len(data_list[idx]['actions']))
         # data_list['old_logprobs'] = logprobs * data_list['action_mask']
         
         return data_list
@@ -661,7 +700,6 @@ def start():
 @dataclass
 class Config:
     train_batch_size: int = 64
-    mini_batch_size: int = 8
     model_name: str = 'Qwen/Qwen2.5-0.5B-Instruct'
     ddp_size: int = 1 
     tp_size: int = 2 
