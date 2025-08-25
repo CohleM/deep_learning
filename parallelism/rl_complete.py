@@ -5,6 +5,7 @@ import torch
 import asyncio
 import pickle
 import time
+import gc
 from qwen_monkey_patch import apply_qwen_patches
 from dataclasses import dataclass
 from torch import distributed as dist
@@ -261,10 +262,10 @@ class Worker:
         fsdp_size = int(int(os.environ['WORLD_SIZE']) / (config.ddp_size * config.tp_size))
         # this mesh will only be used for model partition
         self.mesh = init_device_mesh(device,(config.ddp_size,fsdp_size, config.tp_size), mesh_dim_names=["DDP", "FSDP", "TP"])
-        dp_size = int(int(os.environ['WORLD_SIZE']) / self.config.tp_size)
+        self.dp_size = int(int(os.environ['WORLD_SIZE']) / self.config.tp_size)
 
         # this mesh will be used for data parallelism 
-        self.device_mesh = init_device_mesh(device,(dp_size, config.tp_size), mesh_dim_names=["DP", "TP"])
+        self.device_mesh = init_device_mesh(device,(self.dp_size, config.tp_size), mesh_dim_names=["DP", "TP"])
 
     def prepare_optimizer(self):
         if self.config.tp_size > 1:
@@ -372,7 +373,6 @@ class Rollout(Worker):
     def __call__(self, data_list):
 
         if self.device_mesh['TP'].get_local_rank() ==0:
-            # There's still a bug here, some tp groups have the same data.
             data_list = split_data_list(data_list, mesh=self.device_mesh['DP'])
 
             loop = asyncio.get_event_loop()
@@ -409,6 +409,37 @@ class Rollout(Worker):
         )
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(cuda_visible_devices)
 
+    def update(self, model):
+        # first offload the model to cpu
+        options = StateDictOptions(full_state_dict=False, cpu_offload=True)
+        state_dict = get_model_state_dict(
+            model, options=options
+        )
+
+        # resume sglang's memory occupation
+        torch.cuda.empty_cache()
+        if self.device_mesh["TP"].get_local_rank() == 0:
+            engine.resume_memory_occupation()
+        
+        for idx, (name, tensor) in enumerate(state_dict.items()):
+            # load to gpu again, but this is a small tensor so it won't make much difference
+            tensor = tensor.to(torch.cuda.current_device())
+            # print(name)
+            # if name == 'model.layers.0.self_attn.q_proj.weight':
+                
+            serialized_tensor = MultiprocessingSerializer.serialize(tensor.full_tensor() if isinstance(tensor, DTensor) else tensor)
+            serialized_tensors = [None] * self.device_mesh['TP'].size() if self.device_mesh['TP'].get_local_rank() == 0 else None
+            
+            dist.gather_object(serialized_tensor, serialized_tensors, group_dst=0, group=mesh['TP'].get_group())
+            
+            if self.device_mesh["TP"].get_local_rank() == 0:
+                # print(serialized_tensors)
+                engine.update_weights_from_tensor(named_tensors=[(name, LocalSerializedTensor(values=serialized_tensors))])
+
+            
+            # print(f"rank {dist.get_rank()} seriliazed_tensor {serialized_tensor.shape} len_ST: {len(serialized_tensors) if isinstance(serialized_tensors,list) else serialized_tensors} ")
+
+        dist.barrier()
 
 
         
@@ -499,7 +530,7 @@ class Trainer:
         check_mem_allocated(dist.get_rank(), 'before actor creation')
         self.actor = Actor(config)
 
-        check_mem_allocated(dist.get_rank(), 'after actor rollout')
+        check_mem_allocated(dist.get_rank(), 'after actor creation')
 
         # ------ turn it back on when needed ------
         self.rollout = Rollout(config)
@@ -519,17 +550,17 @@ class Trainer:
             check_mem_allocated(dist.get_rank(), 'after completing rollout')
 
             # save the data_list to picke so that
-            if dist.get_rank() == 0:
+            # if dist.get_rank() == 0:
 
-                with open('data_list.pkl', 'wb') as f:
-                    pickle.dump(data_list, f)
+            #     with open('data_list.pkl', 'wb') as f:
+            #         pickle.dump(data_list, f)
 
             ## --- simulate rollout ---
-            data_list = None 
-            if dist.get_rank() == 0:
+            # data_list = None 
+            # if dist.get_rank() == 0:
                  
-                with open('data_list.pkl', 'rb') as f:
-                    data_list = pickle.load(f)
+            #     with open('data_list.pkl', 'rb') as f:
+            #         data_list = pickle.load(f)
 
             # --- simulate rollout ---
             # print(f'trn loop rank {dist.get_rank()} data_list length {len(data_list) if isinstance(data_list, list) else None}  \n\n' )
@@ -559,19 +590,30 @@ class Trainer:
             # divide the data_list into minibatches, each of size, i.e total_rollout_data_in_this_rank / updates_per_rollout
             mini_batch_size = len(data_list) // self.config.updates_per_rollout
 
-            data_list = [data_list[i*mini_batch_size: (i+1)*mini_batch_size] for i in range(len(data_list))]
+            data_list = [data_list[i*mini_batch_size: (i+1)*mini_batch_size] for i in range(self.config.updates_per_rollout)]
             
-            for minibatch in data_list:
+            for update_step, minibatch in enumerate(data_list):
+                # print(f' RANK {dist.get_rank()}-------- STEP: {update_step} ------------')
                 minibatch_data_list = self.actor.compute_logprobs(minibatch, log_type="current")
 
-                with open('minibatch.pkl', 'wb') as f:
-                    pickle.dump(minibatch_data_list, f)
-                break
-
+                # with open('minibatch.pkl', 'wb') as f:
+                #     pickle.dump(minibatch_data_list, f)
+                # break
+                
                 self.actor.optimizer.zero_grad()
-                loss = grpo_loss(minibatch, max_eps=self.config.max_eps, min_eps=self.config.min_eps)
-                loss.backward() # when we do this, the gradients are averaged among dp groups.
 
+                # we need to multiply by dp_size.
+                # Explanation, in standard pre-training, where each gpu processes some part of the batch_size, the gradients are averaged automatically so that the 
+                # gradients would match if they were trained on one single machine
+                # Ex: if we have batch_size= 32, with 2 gpus, then if we were training on single gpu, we would do loss/total_batch_size,
+                # but if we are doing it on 2 gpus, each gpu will do loss/local_batch_size (i.e 16), that's why we would do, loss/16/2 = loss/32.
+                # see how averaging is only done when sequences belong to the same batch, here in this RL step they do not, so we need to cancel out the auto-averaging.
+                # thus the multiplication by self.dp_size
+                loss = grpo_loss(minibatch, max_eps=self.config.max_eps, min_eps=self.config.min_eps) * self.actor.dp_size
+                print(f'RANK {dist.get_rank()}-------- STEP: {update_step} ------------ loss: {loss} len_data_list {len(data_list)} ')
+                loss.backward() # when we do this, the gradients are averaged among dp groups.
+                
+                check_mem_allocated(dist.get_rank(), 'before optimizer update')
                 self.actor.optimizer.step()
 
                 # loss = compute_ppo_loss(minibatch_data_list)
@@ -593,9 +635,13 @@ class Trainer:
 
             # now the main ppo loss
 
-            break
             # generate rollouts. each train_batch will have length per_rollout_size x responses_per_prompt
             # first scatter the data across each ddp group
+            # now let's update the slgang model with the trained model
+            # takes in actor model, offload it to cpu, and piece by piece update the sglang model
+            self.rollout.update(self.actor.model)
+            break
+
 
 
 def grpo_advantage(data_list, responses_per_prompt):
@@ -718,7 +764,13 @@ class Actor(Worker):
             data_list[idx][f'{log_type}_logprobs'] = logprobs[idx, -len(data_list[idx]['actions']):] # now oldlogprobs and actions will have the same length as actions and action_mask
             print( len(data_list[idx][f'{log_type}_logprobs']) == len(data_list[idx]['actions']))
         # data_list['old_logprobs'] = logprobs * data_list['action_mask']
-        
+
+        # remove the cache
+        check_mem_allocated(dist.get_rank(), 'before clearing cache')
+        gc.collect()
+        torch.cuda.empty_cache() 
+
+        check_mem_allocated(dist.get_rank(), 'after clearing cache')
         return data_list
         # now find the respective logprobs
 
