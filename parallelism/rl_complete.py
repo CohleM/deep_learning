@@ -502,7 +502,7 @@ class Trainer:
         check_mem_allocated(dist.get_rank(), 'after actor rollout')
 
         # ------ turn it back on when needed ------
-        # self.rollout = Rollout(config)
+        self.rollout = Rollout(config)
         #  ------ turn it back on when needed ------
 
     def train(self):
@@ -513,16 +513,16 @@ class Trainer:
         for data_list in train_dataloader:
             # print(f'rank {dist.get_rank()} lenght of data_list {len(data_list)}')
             # let's do the rollout --- turn it back on when doing real rollout ----
-            # data_list = self.rollout(data_list) # rank 0 will only have data_list, otherwise it'll be None
+            data_list = self.rollout(data_list) # rank 0 will only have data_list, otherwise it'll be None
             # let's do the rollout --- turn it back on when doing real rollout ----
 
             check_mem_allocated(dist.get_rank(), 'after completing rollout')
 
             # save the data_list to picke so that
-            # if dist.get_rank() == 0:
+            if dist.get_rank() == 0:
 
-            #     with open('data_list.pkl', 'wb') as f:
-            #         pickle.dump(data_list, f)
+                with open('data_list.pkl', 'wb') as f:
+                    pickle.dump(data_list, f)
 
             ## --- simulate rollout ---
             data_list = None 
@@ -560,14 +560,25 @@ class Trainer:
             mini_batch_size = len(data_list) // self.config.updates_per_rollout
 
             data_list = [data_list[i*mini_batch_size: (i+1)*mini_batch_size] for i in range(len(data_list))]
+            
+            for minibatch in data_list:
+                minibatch_data_list = self.actor.compute_logprobs(minibatch, log_type="current")
 
-            # for minibatch in data_list:
-            #     mini_batch_data_list = self.actor.compute_logprobs(minibatch, log_type="current")
-            #     loss = self.actor.compute_ppo_loss(mini_batch_data_list)
-            #     # then find the ppo loss.
-            #     # do loss.backward()
-            #     # then do optimizer.step()
-            #     self.actor.optimizer.step()
+                with open('minibatch.pkl', 'wb') as f:
+                    pickle.dump(minibatch_data_list, f)
+                break
+
+                self.actor.optimizer.zero_grad()
+                loss = grpo_loss(minibatch, max_eps=self.config.max_eps, min_eps=self.config.min_eps)
+                loss.backward() # when we do this, the gradients are averaged among dp groups.
+
+                self.actor.optimizer.step()
+
+                # loss = compute_ppo_loss(minibatch_data_list)
+                # then find the ppo loss.
+                # do loss.backward()
+                # then do optimizer.step()
+                # self.actor.optimizer.step()
 
             ## ------- actor update section -------
 
@@ -603,6 +614,29 @@ def grpo_advantage(data_list, responses_per_prompt):
 def check_mem_allocated(rank, msg):
     ans = torch.cuda.memory_allocated() / (1024**3)
     print(f'RANK {rank} MEMORY_ALLOCATED {msg} {ans}')
+
+
+import torch
+
+def grpo_loss(minibatch, max_eps, min_eps):
+    old_logprobs = torch.stack([item['old_logprobs'] for item in minibatch], dim=0)
+    logprobs = torch.stack([item['current_logprobs'] for item in minibatch], dim=0)
+    advantage = torch.stack([item['advantage'] for item in minibatch], dim=0).to(torch.cuda.current_device()) # why is this not already in gpu, re-check
+    action_mask = torch.stack([item['action_mask'] for item in minibatch], dim=0).to(torch.cuda.current_device())
+    
+    ratio = torch.exp(logprobs - old_logprobs)
+    ob1 = ratio * advantage
+    ob2 = torch.clamp(ratio, 1.0 - min_eps, 1.0 + max_eps) * advantage
+
+    ppo_loss = -torch.min(ob1, ob2) * action_mask
+
+    loss = ppo_loss.sum(dim=-1)/ action_mask.sum(dim=-1) # mean across tokens
+
+    return loss.mean() # mean across trajectories
+    
+    
+    
+
 
 class Actor(Worker):
     def __init__(self, config):
@@ -709,6 +743,8 @@ class Config:
     per_rollout_size: int = 3
     offload_model: bool = True
     updates_per_rollout: int = 3
+    max_eps: float = 0.02
+    min_eps: float = 0.02
 #     train_batch_size: int = 64
 #  
 def main():
