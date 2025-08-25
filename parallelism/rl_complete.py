@@ -1,4 +1,5 @@
 
+
 import os
 import random
 import torch
@@ -268,11 +269,16 @@ class Worker:
         self.device_mesh = init_device_mesh(device,(self.dp_size, config.tp_size), mesh_dim_names=["DP", "TP"])
 
     def prepare_optimizer(self):
+
+        self.model.gradient_checkpointing_enable()
+
         if self.config.tp_size > 1:
             self.model = prepare_tp_model(self.model, self.mesh)
         
         self.model = prepare_dp_model(self.model, self.mesh)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.config.lr)
+
+        # Enable gradient checkpointing
 
         # offload the model to cpu
         load_model_to_device(self, "cpu")
@@ -419,7 +425,7 @@ class Rollout(Worker):
         # resume sglang's memory occupation
         torch.cuda.empty_cache()
         if self.device_mesh["TP"].get_local_rank() == 0:
-            engine.resume_memory_occupation()
+            self.engine.resume_memory_occupation()
         
         for idx, (name, tensor) in enumerate(state_dict.items()):
             # load to gpu again, but this is a small tensor so it won't make much difference
@@ -430,11 +436,11 @@ class Rollout(Worker):
             serialized_tensor = MultiprocessingSerializer.serialize(tensor.full_tensor() if isinstance(tensor, DTensor) else tensor)
             serialized_tensors = [None] * self.device_mesh['TP'].size() if self.device_mesh['TP'].get_local_rank() == 0 else None
             
-            dist.gather_object(serialized_tensor, serialized_tensors, group_dst=0, group=mesh['TP'].get_group())
+            dist.gather_object(serialized_tensor, serialized_tensors, group_dst=0, group=self.device_mesh['TP'].get_group())
             
             if self.device_mesh["TP"].get_local_rank() == 0:
                 # print(serialized_tensors)
-                engine.update_weights_from_tensor(named_tensors=[(name, LocalSerializedTensor(values=serialized_tensors))])
+                self.engine.update_weights_from_tensor(named_tensors=[(name, LocalSerializedTensor(values=serialized_tensors))])
 
             
             # print(f"rank {dist.get_rank()} seriliazed_tensor {serialized_tensor.shape} len_ST: {len(serialized_tensors) if isinstance(serialized_tensors,list) else serialized_tensors} ")
@@ -541,7 +547,10 @@ class Trainer:
         train_dataloader = StatefulDataLoader(train_data, batch_size=self.config.per_rollout_size, drop_last=True, collate_fn=train_data.collate_fn)
         # construct train dataloader
         
-        for data_list in train_dataloader:
+        for train_idx, data_list in enumerate(train_dataloader):
+            if dist.get_rank() == 0:
+                print(f' ----------------- TRAIN IDX {train_idx} ------------------') 
+
             # print(f'rank {dist.get_rank()} lenght of data_list {len(data_list)}')
             # let's do the rollout --- turn it back on when doing real rollout ----
             data_list = self.rollout(data_list) # rank 0 will only have data_list, otherwise it'll be None
@@ -600,8 +609,8 @@ class Trainer:
                 #     pickle.dump(minibatch_data_list, f)
                 # break
                 
-                self.actor.optimizer.zero_grad()
 
+                
                 # we need to multiply by dp_size.
                 # Explanation, in standard pre-training, where each gpu processes some part of the batch_size, the gradients are averaged automatically so that the 
                 # gradients would match if they were trained on one single machine
@@ -614,8 +623,18 @@ class Trainer:
                 loss.backward() # when we do this, the gradients are averaged among dp groups.
                 
                 check_mem_allocated(dist.get_rank(), 'before optimizer update')
-                self.actor.optimizer.step()
 
+                load_model_to_device(self.actor, torch.cuda.current_device())
+                load_optimizer_to_device(self.actor, torch.cuda.current_device())
+
+                check_mem_allocated(dist.get_rank(), 'after moving optimizer to GPU')
+
+                self.actor.optimizer.step()
+                self.actor.optimizer.zero_grad()
+                load_optimizer_to_device(self.actor, "cpu")
+
+
+                check_mem_allocated(dist.get_rank(), '---- clearing optimizer to cpu')
                 # loss = compute_ppo_loss(minibatch_data_list)
                 # then find the ppo loss.
                 # do loss.backward()
@@ -626,11 +645,8 @@ class Trainer:
 
             ## ------- actor update section -------
 
-            print(f'trn loop rank {dist.get_rank()} data_list length {len(data_list) if isinstance(data_list, list) else None} mesh {self.actor.device_mesh} datalist: {len(data_list[0])} \n\n' )
+            # print(f'trn loop rank {dist.get_rank()} data_list length {len(data_list) if isinstance(data_list, list) else None} mesh {self.actor.device_mesh} datalist: {len(data_list[0])} \n\n' )
             # now lets do the update.
-
-
-
 
 
             # now the main ppo loss
@@ -640,7 +656,6 @@ class Trainer:
             # now let's update the slgang model with the trained model
             # takes in actor model, offload it to cpu, and piece by piece update the sglang model
             self.rollout.update(self.actor.model)
-            break
 
 
 
@@ -665,10 +680,15 @@ def check_mem_allocated(rank, msg):
 import torch
 
 def grpo_loss(minibatch, max_eps, min_eps):
-    old_logprobs = torch.stack([item['old_logprobs'] for item in minibatch], dim=0)
-    logprobs = torch.stack([item['current_logprobs'] for item in minibatch], dim=0)
-    advantage = torch.stack([item['advantage'] for item in minibatch], dim=0).to(torch.cuda.current_device()) # why is this not already in gpu, re-check
-    action_mask = torch.stack([item['action_mask'] for item in minibatch], dim=0).to(torch.cuda.current_device())
+    max_len = max(item['old_logprobs'].shape[0] for item in minibatch)
+
+    def pad_tensor(t, max_len):
+        return torch.nn.functional.pad(t, (max_len - t.shape[0], 0))  # pad on left
+
+    old_logprobs = torch.stack([pad_tensor(item['old_logprobs'], max_len) for item in minibatch], dim=0)
+    logprobs     = torch.stack([pad_tensor(item['current_logprobs'], max_len) for item in minibatch], dim=0)
+    advantage    = torch.stack([pad_tensor(item['advantage'], max_len) for item in minibatch], dim=0).to(torch.cuda.current_device())
+    action_mask  = torch.stack([pad_tensor(item['action_mask'], max_len) for item in minibatch], dim=0).to(torch.cuda.current_device())
     
     ratio = torch.exp(logprobs - old_logprobs)
     ob1 = ratio * advantage
@@ -767,12 +787,30 @@ class Actor(Worker):
 
         # remove the cache
         check_mem_allocated(dist.get_rank(), 'before clearing cache')
+        # load_model_to_device(self, "cpu")
+        del logits
         gc.collect()
         torch.cuda.empty_cache() 
 
         check_mem_allocated(dist.get_rank(), 'after clearing cache')
         return data_list
         # now find the respective logprobs
+
+
+def load_optimizer_to_device(worker, device):
+
+    # if not getattr(worker.config, "offload_optimizer", False):
+    #     return
+
+    for param_group in worker.optimizer.param_groups:
+        for param in param_group["params"]:
+            state = worker.optimizer.state[param]
+            for key, value in state.items():
+                if isinstance(value, torch.Tensor):
+                    state[key] = value.to(
+                        device, non_blocking=True
+                    )
+
 
 def start():
     # nest_asyncio.apply()
