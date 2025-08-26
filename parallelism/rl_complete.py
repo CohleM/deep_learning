@@ -350,7 +350,7 @@ class Rollout(Worker):
 
         # print(ans)
         response = await self.engine.async_generate(
-                prompt
+                prompt, sampling_params={"temperature": self.config.temperature}
             )
         # response = sample_response
 
@@ -559,10 +559,10 @@ class Trainer:
             check_mem_allocated(dist.get_rank(), 'after completing rollout')
 
             # save the data_list to picke so that
-            # if dist.get_rank() == 0:
+            if dist.get_rank() == 0:
 
-            #     with open('data_list.pkl', 'wb') as f:
-            #         pickle.dump(data_list, f)
+                with open('data_list.pkl', 'wb') as f:
+                    pickle.dump(data_list, f)
 
             ## --- simulate rollout ---
             # data_list = None 
@@ -605,8 +605,8 @@ class Trainer:
                 # print(f' RANK {dist.get_rank()}-------- STEP: {update_step} ------------')
                 minibatch_data_list = self.actor.compute_logprobs(minibatch, log_type="current")
 
-                # with open('minibatch.pkl', 'wb') as f:
-                #     pickle.dump(minibatch_data_list, f)
+                with open('minibatch.pkl', 'wb') as f:
+                    pickle.dump(minibatch_data_list, f)
                 # break
                 
 
@@ -823,6 +823,7 @@ def start():
 
 @dataclass
 class Config:
+    temperature: float = 1.0
     train_batch_size: int = 64
     model_name: str = 'Qwen/Qwen2.5-0.5B-Instruct'
     ddp_size: int = 1 
