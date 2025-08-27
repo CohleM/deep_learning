@@ -1,6 +1,7 @@
 
 
 import os
+import re
 import random
 import torch
 import asyncio
@@ -355,7 +356,8 @@ class Rollout(Worker):
         # response = sample_response
 
         # generate sparse reward
-        reward = random.randint(0,1)
+        reward = reward_fn(response, answer) 
+
         messages.append({'role': 'assistant', 'content': response['text']})
 
         tokenized_response = self.tokenizer.encode(response['text'])
@@ -593,7 +595,7 @@ class Trainer:
             with torch.no_grad():
                 data_list = self.actor.compute_logprobs(data_list, log_type='old')
 
-            break
+            # break
             # collect the data_list from all dp groups, each dp group src 0 will get whole data, if we need to later divide the data, then why gather here, pointless right now
             # data_list = gather_data_list(data_list, self.actor.device_mesh['DP'])
 
@@ -605,14 +607,8 @@ class Trainer:
             
             for update_step, minibatch in enumerate(data_list):
                 # print(f' RANK {dist.get_rank()}-------- STEP: {update_step} ------------')
-                minibatch_data_list = self.actor.compute_logprobs(minibatch, log_type="current")
+                minibatch = self.actor.compute_logprobs(minibatch, log_type="current")
 
-                with open('minibatch.pkl', 'wb') as f:
-                    pickle.dump(minibatch_data_list, f)
-                # break
-                
-
-                
                 # we need to multiply by dp_size.
                 # Explanation, in standard pre-training, where each gpu processes some part of the batch_size, the gradients are averaged automatically so that the 
                 # gradients would match if they were trained on one single machine
@@ -622,8 +618,20 @@ class Trainer:
                 # thus the multiplication by self.dp_size
                 loss = grpo_loss(minibatch, max_eps=self.config.max_eps, min_eps=self.config.min_eps) * self.actor.dp_size
                 print(f'RANK {dist.get_rank()}-------- STEP: {update_step} ------------ loss: {loss} len_data_list {len(data_list)} ')
-                loss.backward() # when we do this, the gradients are averaged among dp groups.
+
                 
+                loss.backward() # when we do this, the gradients are averaged among dp groups.
+
+
+                layers_to_check = ["model.layers.0.self_attn.q_proj.weight",
+                                "model.layers.0.mlp.up_proj.weight"]
+
+                for  param in self.actor.model.parameters():
+                    if param.grad is not None:
+                        print(f"[Rank {dist.get_rank()}] grad mean = {param.grad.mean().item()}")
+                    else:
+                        print(f"[Rank {dist.get_rank()}]  grad is None")
+
                 check_mem_allocated(dist.get_rank(), 'before optimizer update')
 
                 load_model_to_device(self.actor, torch.cuda.current_device())
@@ -660,6 +668,15 @@ class Trainer:
             self.rollout.update(self.actor.model)
 
 
+def reward_fn(predicted_answer, actual_answer):
+    # use regex to scrape the answer from \\boxed{answer}
+    m = re.search(r'\\boxed\{([^}]*)\}', predicted_answer)
+    answer = m.group(1).strip() if m else None
+    if answer == actual_answer.strip():
+        return 1.0
+    else:
+        return 0.0
+
 
 def grpo_advantage(data_list, responses_per_prompt):
   rewards = torch.tensor([ex['rewards'].sum() for ex in data_list]).view(-1, responses_per_prompt)
@@ -691,7 +708,8 @@ def grpo_loss(minibatch, max_eps, min_eps):
     logprobs     = torch.stack([pad_tensor(item['current_logprobs'], max_len) for item in minibatch], dim=0)
     advantage    = torch.stack([pad_tensor(item['advantage'], max_len) for item in minibatch], dim=0).to(torch.cuda.current_device())
     action_mask  = torch.stack([pad_tensor(item['action_mask'], max_len) for item in minibatch], dim=0).to(torch.cuda.current_device())
-    
+
+    # print('ADVANTAGES', advantage) 
     ratio = torch.exp(logprobs - old_logprobs)
     ob1 = ratio * advantage
     ob2 = torch.clamp(ratio, 1.0 - min_eps, 1.0 + max_eps) * advantage
@@ -748,9 +766,9 @@ class Actor(Worker):
         position_ids = attention_mask.long().cumsum(-1) - 1
         position_ids.masked_fill_(attention_mask == 0, 0).to('cuda')
 
-        if dist.get_rank() == 0:
-            print(position_ids, padded_input_ids['input_ids'])    
-        # print(f'rank {dist.get_rank()} and  padded input ids shape {padded_input_ids['input_ids'].shape} attention mask shape {padded_input_ids['attention_mask'].shape} position ids shape, {position_ids.shape}\n\n ')
+        # if dist.get_rank() == 0:
+        #     print(position_ids, padded_input_ids['input_ids'])    
+        # # print(f'rank {dist.get_rank()} and  padded input ids shape {padded_input_ids['input_ids'].shape} attention mask shape {padded_input_ids['attention_mask'].shape} position ids shape, {position_ids.shape}\n\n ')
         # print(f'rank {dist.get_rank()} position ids shape, ')
 
 
@@ -843,8 +861,8 @@ class Config:
     per_rollout_size: int = 3
     offload_model: bool = True
     updates_per_rollout: int = 3
-    max_eps: float = 0.02
-    min_eps: float = 0.02
+    max_eps: float = 0.2 
+    min_eps: float = 0.2 
 #     train_batch_size: int = 64
 #  
 def main():
