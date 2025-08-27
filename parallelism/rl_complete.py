@@ -395,10 +395,10 @@ class Rollout(Worker):
 
             # gather all the data_list 
             data_list = gather_data_list(data_list, self.device_mesh['DP'])
-            all_messages = gather_data_list(all_messages, self.device_mesh['DP'])
+            # all_messages = gather_data_list(all_messages, self.device_mesh['DP'])
 
         if dist.get_rank() == 0:
-            return data_list, all_messages
+            return data_list
 
 
     def prepare_env_var(self):
@@ -540,7 +540,7 @@ class Trainer:
         check_mem_allocated(dist.get_rank(), 'after actor creation')
 
         # ------ turn it back on when needed ------
-        self.rollout = Rollout(config)
+        # self.rollout = Rollout(config)
         #  ------ turn it back on when needed ------
 
     def train(self):
@@ -554,27 +554,23 @@ class Trainer:
 
             # print(f'rank {dist.get_rank()} lenght of data_list {len(data_list)}')
             # let's do the rollout --- turn it back on when doing real rollout ----
-            data_list,all_messages = self.rollout(data_list) # rank 0 will only have data_list, otherwise it'll be None
+            # data_list = self.rollout(data_list) # rank 0 will only have data_list, otherwise it'll be None
             # let's do the rollout --- turn it back on when doing real rollout ----
 
             check_mem_allocated(dist.get_rank(), 'after completing rollout')
 
             # save the data_list to picke so that
-            if dist.get_rank() == 0:
+            # if dist.get_rank() == 0:
 
-                with open('all_messages.pkl', 'wb') as f:
-                    pickle.dump(all_messages, f)
-
-
-                with open('data_list.pkl', 'wb') as f:
-                    pickle.dump(data_list, f)
+            #     with open('data_list.pkl', 'wb') as f:
+            #         pickle.dump(data_list, f)
 
             ## --- simulate rollout ---
-            # data_list = None 
-            # if dist.get_rank() == 0:
+            data_list = None 
+            if dist.get_rank() == 0:
                  
-            #     with open('data_list.pkl', 'rb') as f:
-            #         data_list = pickle.load(f)
+                with open('data_list.pkl', 'rb') as f:
+                    data_list = pickle.load(f)
 
             # --- simulate rollout ---
             # print(f'trn loop rank {dist.get_rank()} data_list length {len(data_list) if isinstance(data_list, list) else None}  \n\n' )
@@ -597,6 +593,7 @@ class Trainer:
             with torch.no_grad():
                 data_list = self.actor.compute_logprobs(data_list, log_type='old')
 
+            break
             # collect the data_list from all dp groups, each dp group src 0 will get whole data, if we need to later divide the data, then why gather here, pointless right now
             # data_list = gather_data_list(data_list, self.actor.device_mesh['DP'])
 
@@ -746,10 +743,13 @@ class Actor(Worker):
         action_input_ids = self.tokenizer.pad(action_batch, padding=True, padding_side='left')['input_ids'].to('cuda')
 
         # print(f'rank {dist.get_rank()} and  padded input ids shape {padded_input_ids['input_ids'].shape} attention mask shape {padded_input_ids['attention_mask'].shape} ')
-        attention_mask = padded_input_ids['attention_mask']
+        padded_input_ids['input_ids'] = padded_input_ids['input_ids'].to('cuda')
+        attention_mask = padded_input_ids['attention_mask'].to('cuda')
         position_ids = attention_mask.long().cumsum(-1) - 1
-        position_ids.masked_fill_(attention_mask == 0, 0)
+        position_ids.masked_fill_(attention_mask == 0, 0).to('cuda')
 
+        if dist.get_rank() == 0:
+            print(position_ids, padded_input_ids['input_ids'])    
         # print(f'rank {dist.get_rank()} and  padded input ids shape {padded_input_ids['input_ids'].shape} attention mask shape {padded_input_ids['attention_mask'].shape} position ids shape, {position_ids.shape}\n\n ')
         # print(f'rank {dist.get_rank()} position ids shape, ')
 
@@ -765,6 +765,8 @@ class Actor(Worker):
         dist.barrier()
 
         print(f' rank {dist.get_rank()} logits {logits.shape}')
+        print(f' rank {dist.get_rank()} logits {logits[-1][0][:5]}')
+
         # reconstruct action mask from padded_input_ids
 
         # if log_type=='old': # only update the action mask once, cause this function will be executed for calculating current logprobs
@@ -790,14 +792,16 @@ class Actor(Worker):
             print( len(data_list[idx][f'{log_type}_logprobs']) == len(data_list[idx]['actions']))
         # data_list['old_logprobs'] = logprobs * data_list['action_mask']
 
+        if dist.get_rank() == 0:
+            print(f' actual logprobs {data_list[0]['old_logprobs']} ')
         # remove the cache
-        check_mem_allocated(dist.get_rank(), 'before clearing cache')
+        # check_mem_allocated(dist.get_rank(), 'before clearing cache')
         # load_model_to_device(self, "cpu")
         del logits
         gc.collect()
         torch.cuda.empty_cache() 
 
-        check_mem_allocated(dist.get_rank(), 'after clearing cache')
+        # check_mem_allocated(dist.get_rank(), 'after clearing cache')
         return data_list
         # now find the respective logprobs
 
