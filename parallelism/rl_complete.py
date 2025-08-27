@@ -395,9 +395,10 @@ class Rollout(Worker):
 
             # gather all the data_list 
             data_list = gather_data_list(data_list, self.device_mesh['DP'])
+            all_messages = gather_data_list(all_messages, self.device_mesh['DP'])
 
         if dist.get_rank() == 0:
-            return data_list
+            return data_list, all_messages
 
 
     def prepare_env_var(self):
@@ -553,13 +554,17 @@ class Trainer:
 
             # print(f'rank {dist.get_rank()} lenght of data_list {len(data_list)}')
             # let's do the rollout --- turn it back on when doing real rollout ----
-            data_list = self.rollout(data_list) # rank 0 will only have data_list, otherwise it'll be None
+            data_list,all_messages = self.rollout(data_list) # rank 0 will only have data_list, otherwise it'll be None
             # let's do the rollout --- turn it back on when doing real rollout ----
 
             check_mem_allocated(dist.get_rank(), 'after completing rollout')
 
             # save the data_list to picke so that
             if dist.get_rank() == 0:
+
+                with open('all_messages.pkl', 'wb') as f:
+                    pickle.dump(all_messages, f)
+
 
                 with open('data_list.pkl', 'wb') as f:
                     pickle.dump(data_list, f)
