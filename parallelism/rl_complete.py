@@ -2,12 +2,15 @@
 
 import os
 import re
+from math_verify import parse, verify
 import random
 import torch
 import asyncio
 import pickle
 import time
 import gc
+import wandb
+from collections import defaultdict
 from qwen_monkey_patch import apply_qwen_patches
 from dataclasses import dataclass
 from torch import distributed as dist
@@ -118,6 +121,7 @@ class RLDataset(Dataset):
         ex = self.dataset[idx]
         messages = ex["messages"]
         answer = ex["answer"]
+        # answer = ex["target"]
 
         return {
             "messages": messages,
@@ -351,17 +355,24 @@ class Rollout(Worker):
         self.device_mesh = init_device_mesh("cuda", (dp_size, self.config.tp_size), mesh_dim_names=["DP", "TP"]) # device is on cpu cause we only need this mesh to scatter data (i.e for data parallelism)
         
     async def rollout(self, data):
-
+        
+        metric = defaultdict(list)
         messages,answer = data['messages'], data['answer']
 
-        prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        states = self.tokenizer.encode(prompt)
+        if not self.config.apply_chat_template:
+            prompt = data['messages'] 
+            states = self.tokenizer.encode(prompt)
+        else:
+            prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            states = self.tokenizer.encode(prompt)
+
         actions = [0] * len(states)
         action_mask = [0] * len(states)
 
         # print(ans)
         response = await self.engine.async_generate(
-                prompt, sampling_params={"temperature": self.config.temperature, "max_new_tokens" : 512}
+                prompt, sampling_params={"temperature": self.config.temperature}
+                # prompt, sampling_params={"temperature": self.config.temperature, "max_new_tokens" : 512}
             )
         
         info = response["meta_info"]
@@ -379,10 +390,15 @@ class Rollout(Worker):
         actions.extend(tokenized_response)
         action_mask.extend([1] * len(tokenized_response))
 
+        # wandb metrics
+        metric['response_length'] = info['completion_tokens']
+        metric['trajectory_length'] = len(states)
+        metric['reward'] = reward
+
         # sparse reward, only provide to the last token, putting extra -1 here cause later we do states[:-1]
         rewards = (len(states) -1 - 1)*[0] + [reward]
 
-
+        print(response['text'])
         ex = {
             'states' : torch.LongTensor(states[:-1]),
             'action_mask' : torch.LongTensor(action_mask[1:]),
@@ -390,7 +406,7 @@ class Rollout(Worker):
             'actions' : torch.LongTensor(actions[1:])
         }
 
-        return ex, messages
+        return ex, messages, metric
 
     def __call__(self, data_list):
 
@@ -407,14 +423,20 @@ class Rollout(Worker):
         dist.barrier()
 
         if self.device_mesh['TP'].get_local_rank() == 0:
-            data_list, all_messages = map(list,zip(*outputs))
+            data_list, all_messages, metrics = map(list,zip(*outputs)) # metrics is a list of dict, exp [{'response_length': 512, 'reward' : 1}]
 
+            print('ggg metrics list', metrics)
             # gather all the data_list 
             data_list = gather_data_list(data_list, self.device_mesh['DP'])
+            metrics = gather_data_list(metrics, self.device_mesh['DP'])
+
+            print('after gather',metrics)
             # all_messages = gather_data_list(all_messages, self.device_mesh['DP'])
 
         if dist.get_rank() == 0:
-            return data_list
+            return data_list, metrics
+        else:
+            return None, None
 
 
     def prepare_env_var(self):
@@ -556,8 +578,12 @@ class Trainer:
         check_mem_allocated(dist.get_rank(), 'after actor creation')
 
         # ------ turn it back on when needed ------
-        # self.rollout = Rollout(config)
+        self.rollout = Rollout(config)
         #  ------ turn it back on when needed ------
+
+        # init wandb
+        if dist.get_rank() == 0:
+            wandb.init(project=self.config.project_name, name=self.config.experiment_name, config=self.config)
 
     def train(self):
         train_data = RLDataset(self.config.data_path, self.config.responses_per_prompt)
@@ -589,8 +615,10 @@ class Trainer:
 
             # print(f'rank {dist.get_rank()} lenght of data_list {len(data_list)}')
             # let's do the rollout --- turn it back on when doing real rollout ----
-            # data_list = self.rollout(data_list) # rank 0 will only have data_list, otherwise it'll be None
+            data_list, metrics = self.rollout(data_list) # rank 0 will only have data_list, otherwise it'll be None
             # let's do the rollout --- turn it back on when doing real rollout ----
+
+
 
             check_mem_allocated(dist.get_rank(), 'after completing rollout')
 
@@ -601,11 +629,11 @@ class Trainer:
             #         pickle.dump(data_list, f)
 
             ## --- simulate rollout ---
-            data_list = None 
-            if dist.get_rank() == 0:
+            # data_list = None 
+            # if dist.get_rank() == 0:
                  
-                with open('data_list.pkl', 'rb') as f:
-                    data_list = pickle.load(f)
+            #     with open('data_list.pkl', 'rb') as f:
+            #         data_list = pickle.load(f)
 
             # --- simulate rollout ---
             # print(f'trn loop rank {dist.get_rank()} data_list length {len(data_list) if isinstance(data_list, list) else None}  \n\n' )
@@ -626,6 +654,7 @@ class Trainer:
             data_list = broadcast_data_list(data_list, self.actor.device_mesh['TP'])
             
             with torch.no_grad():
+                self.actor.model.eval()
                 data_list = self.actor.compute_logprobs(data_list, log_type='old')
 
             # break
@@ -647,8 +676,12 @@ class Trainer:
             if dist.get_rank() == 0:
                 check_mem_allocated(dist.get_rank(), '---- AFTER LOADING TO GPU BEFORE UPDATE STAGE ----')
 
+            dp_metrics = defaultdict(list)
+
+            dp_loss = 0.0
             for update_step, minibatch in enumerate(data_list):
                 # print(f' RANK {dist.get_rank()}-------- STEP: {update_step} ------------')
+                self.actor.model.train()
                 minibatch = self.actor.compute_logprobs(minibatch, log_type="current")
 
                 # we need to multiply by dp_size.
@@ -661,6 +694,7 @@ class Trainer:
                 loss = grpo_loss(minibatch, max_eps=self.config.max_eps, min_eps=self.config.min_eps) * self.actor.dp_size
                 print(f'RANK {dist.get_rank()}-------- STEP: {update_step} ------------ loss: {loss} len_data_list {len(data_list)} ')
 
+                dp_loss +=loss
                 
                 loss.backward() # when we do this, the gradients are averaged among dp groups.
 
@@ -674,7 +708,7 @@ class Trainer:
                     # else:
                         # print(f"[Rank {dist.get_rank()}]  grad is None")
 
-
+                torch.nn.utils.clip_grad_norm_(self.actor.model.parameters(), max_norm=1.0)
                 self.actor.optimizer.step()
                 self.actor.optimizer.zero_grad()
                 # load_optimizer_to_device(self.actor, "cpu")
@@ -701,6 +735,19 @@ class Trainer:
             # first scatter the data across each ddp group
             # now let's update the slgang model with the trained model
             # takes in actor model, offload it to cpu, and piece by piece update the sglang model
+
+            dp_loss = gather_data_list([dp_loss], self.actor.device_mesh['DP'])
+            dp_loss = sum(dp_loss)/len(dp_loss)
+
+            # Log wandb metrics
+            if dist.get_rank() == 0:
+                # Averaging all the metrics
+                metrics = {k: sum([item[k] for item in metrics])/len(metrics) for k in metrics[0].keys()}
+                metrics['loss'] = dp_loss
+                metrics['step'] = step
+                wandb.log(metrics)
+
+
             load_model_to_device(self.actor, "cpu")
             load_optimizer_to_device(self.actor, "cpu")  
             if dist.get_rank() == 0:
@@ -720,15 +767,27 @@ class Trainer:
             self.rollout.update(self.actor.model)
 
 
-def reward_fn(predicted_answer, actual_answer):
-    # use regex to scrape the answer from \\boxed{answer}
-    m = re.search(r'\\boxed\{([^}]*)\}', predicted_answer)
-    answer = m.group(1).strip() if m else None
-    if answer == actual_answer.strip():
-        return 1.0
-    else:
-        return 0.0
+# def reward_fn(predicted_answer, actual_answer):
+#     # use regex to scrape the answer from \\boxed{answer}
+#     m = re.search(r'\\boxed\{([^}]*)\}', predicted_answer)
+#     answer = m.group(1).strip() if m else None
+#     if answer == actual_answer.strip():
+#         return 1.0
+#     else:
+#         return 0.0
 
+
+
+def reward_fn(output, ground_truth_ans): 
+    reward = 0.0
+    answer_match = re.search(r"<answer>(.*?)</answer>", output, flags=re.DOTALL)
+    answer = answer_match.group(1).strip() if answer_match else None
+
+    result = verify(parse(answer), parse(str(ground_truth_ans)))
+    reward += 1.0 if result else 0.01
+    reward += 0.20 if re.search(r"<think>.*?</think>", output, flags=re.DOTALL) else 0.0
+
+    return reward
 
 def grpo_advantage(data_list, responses_per_prompt):
   rewards = torch.tensor([ex['rewards'].sum() for ex in data_list]).view(-1, responses_per_prompt)
@@ -905,18 +964,24 @@ class Config:
     temperature: float = 1.0
     train_batch_size: int = 64
     model_name: str = 'Qwen/Qwen2.5-0.5B-Instruct'
+    # model_name: str = 'Qwen/Qwen2.5-3B'
     ddp_size: int = 1 
     tp_size: int = 2 
     lr: float = 1e-6
     data_path: str = 'CohleM/olympiad_small'
-    responses_per_prompt: int = 2 
-    per_rollout_size: int = 3
+    # data_path: str = 'Majis699/countdown'
+    responses_per_prompt: int = 3 
+    per_rollout_size: int = 4 
     offload_model: bool = True
-    updates_per_rollout: int = 3
+    updates_per_rollout: int = 3 
     max_eps: float = 0.2 
     min_eps: float = 0.2 
-    checkpoint_interval: int = 10
-    resume_steps: int = 0
+    checkpoint_interval: int = 20
+    resume_steps: int = None
+    project_name: str = "rl"
+    experiment_name: str = "test-countdown-qwen-3b"
+    apply_chat_template: str = True # if using False, use base model, else Instruct model
+    # apply_chat_template: str = False # if using False, use base model, else Instruct model
 #     train_batch_size: int = 64
 #  
 def main():

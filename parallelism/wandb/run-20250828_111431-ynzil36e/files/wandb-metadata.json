@@ -1,0 +1,42 @@
+{
+  "os":  "macOS-14.3-arm64-arm-64bit",
+  "python":  "CPython 3.12.7",
+  "startedAt":  "2025-08-28T05:29:31.831482Z",
+  "program":  "<python with no main file>",
+  "git":  {
+    "remote":  "https://github.com/CohleM/deep_learning.git",
+    "commit":  "bc38eab1eb175f54ef6b30350de7cd32f1b9f9ac"
+  },
+  "email":  "manish981194@gmail.com",
+  "root":  "/Users/cohlem/Projects/Experimentation/Deep Learning/parallelism",
+  "host":  "Manishs-MacBook-Air.local",
+  "executable":  "/Users/cohlem/anaconda3/envs/deep_learning/bin/python",
+  "cpu_count":  8,
+  "cpu_count_logical":  8,
+  "disk":  {
+    "/":  {
+      "total":  "245107195904",
+      "used":  "244270374912"
+    },
+    "/System/Volumes/Data":  {
+      "total":  "245107195904",
+      "used":  "244270374912"
+    }
+  },
+  "memory":  {
+    "total":  "8589934592"
+  },
+  "cpu":  {
+    "count":  8,
+    "countLogical":  8
+  },
+  "apple":  {
+    "name":  "Apple M1",
+    "ecpuCores":  4,
+    "pcpuCores":  4,
+    "gpuCores":  7,
+    "memoryGb":  8,
+    "swapTotalBytes":  "8589934592",
+    "ramTotalBytes":  "8589934592"
+  }
+}
