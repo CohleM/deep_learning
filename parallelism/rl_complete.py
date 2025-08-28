@@ -31,8 +31,10 @@ from torch.distributed.tensor.parallel import (ColwiseParallel,
 
 
 from torch.distributed.checkpoint.state_dict import (
-    StateDictOptions, get_model_state_dict, get_state_dict
+    StateDictOptions, get_model_state_dict, get_state_dict, set_model_state_dict
 )
+import torch.distributed.checkpoint as dcp
+
 from torchdata.stateful_dataloader import StatefulDataLoader
 from sglang.srt.utils import MultiprocessingSerializer
 from sglang.srt.model_executor.model_runner import LocalSerializedTensor
@@ -59,6 +61,16 @@ import copy
 from torch.utils.data import Dataset
 
 import math
+
+def get_dcp_model_state_dict(model,optimizer, data_loader, step):
+    options = StateDictOptions(full_state_dict=False, cpu_offload=True) 
+    return {
+        "model" : get_model_state_dict(model, options=options),
+        "optimizer" : optimizer.state_dict(),
+        "data_loader" : data_loader.state_dict(),
+        "step" : step
+        }
+
 
 def split_data_list(data_list, mesh):
   # we need to scatter this data_list across this mesh group, from local group 0.
@@ -113,8 +125,6 @@ class RLDataset(Dataset):
         }
     def __len__(self):
         return len(self.dataset)
-
-
 
     def collate_fn(self, batch):
 
@@ -351,12 +361,16 @@ class Rollout(Worker):
 
         # print(ans)
         response = await self.engine.async_generate(
-                prompt, sampling_params={"temperature": self.config.temperature}
+                prompt, sampling_params={"temperature": self.config.temperature, "max_new_tokens" : 512}
             )
+        
+        info = response["meta_info"]
+        print('completion tokens', info['completion_tokens'])
         # response = sample_response
 
         # generate sparse reward
-        reward = reward_fn(response, answer) 
+        reward = reward_fn(response['text'], answer) 
+        print(f'rank {dist.get_rank()} reawrd gg {reward}')
 
         messages.append({'role': 'assistant', 'content': response['text']})
 
@@ -498,7 +512,7 @@ def get_output_logits(logits, actions, mesh):
   gathered_vocab_sizes = [torch.zeros_like(local_vocab_size) for _ in range(mesh['TP'].size())]
 
 
-  print(local_vocab_size.dtype)
+#   print(local_vocab_size.dtype)
   dist.all_gather(gathered_vocab_sizes, local_vocab_size, mesh['TP'].get_group())
 
   cu_vocab_size = torch.cumsum(
@@ -523,7 +537,7 @@ def get_output_logits(logits, actions, mesh):
   local_logits = logits[:, local_action_indices]
 
   action_logits = torch.zeros(actions.shape, device=torch.cuda.current_device()).type_as(local_logits)
-  print('action logits dtype', action_logits.dtype)
+#   print('action logits dtype', action_logits.dtype)
   action_logits[:,local_action_indices] = torch.gather(local_logits, -1, local_actions.unsqueeze(-1)).squeeze(-1)
 
   # now this action_logits needs to be all reduced.
@@ -549,8 +563,27 @@ class Trainer:
         train_data = RLDataset(self.config.data_path, self.config.responses_per_prompt)
         train_dataloader = StatefulDataLoader(train_data, batch_size=self.config.per_rollout_size, drop_last=True, collate_fn=train_data.collate_fn)
         # construct train dataloader
+        step = 0
+
+        # Load the checkpoint
+        if self.config.resume_steps is not None:
+            # while loading models and optimizers should be on compute device 
+            load_model_to_device(self.actor, torch.cuda.current_device())
+            load_optimizer_to_device(self.actor, torch.cuda.current_device())
+            state_dict = get_dcp_model_state_dict(self.actor.model, self.actor.optimizer, train_dataloader, step)
+            dcp.load(state_dict=state_dict, checkpoint_id=f"test_folder/{self.config.resume_steps}") 
+
+            set_model_state_dict(self.actor.model, state_dict['model']) 
+            self.actor.optimizer.load_state_dict(state_dict['optimizer'])
+            train_dataloader.load_state_dict(state_dict['data_loader'])
+            step = state_dict['step'] 
+            print(f'successfully loaded the model\n')
+
+            load_model_to_device(self.actor, 'cpu')
+            load_optimizer_to_device(self.actor, 'cpu') 
         
         for train_idx, data_list in enumerate(train_dataloader):
+            
             if dist.get_rank() == 0:
                 print(f' ----------------- TRAIN IDX {train_idx} ------------------') 
 
@@ -604,7 +637,16 @@ class Trainer:
             mini_batch_size = len(data_list) // self.config.updates_per_rollout
 
             data_list = [data_list[i*mini_batch_size: (i+1)*mini_batch_size] for i in range(self.config.updates_per_rollout)]
-            
+
+            if dist.get_rank() == 0:
+                check_mem_allocated(dist.get_rank(), '---- BEFORE UPDATE STAGE ----')
+
+            load_model_to_device(self.actor, torch.cuda.current_device())
+            load_optimizer_to_device(self.actor, torch.cuda.current_device()) 
+
+            if dist.get_rank() == 0:
+                check_mem_allocated(dist.get_rank(), '---- AFTER LOADING TO GPU BEFORE UPDATE STAGE ----')
+
             for update_step, minibatch in enumerate(data_list):
                 # print(f' RANK {dist.get_rank()}-------- STEP: {update_step} ------------')
                 minibatch = self.actor.compute_logprobs(minibatch, log_type="current")
@@ -626,25 +668,19 @@ class Trainer:
                 layers_to_check = ["model.layers.0.self_attn.q_proj.weight",
                                 "model.layers.0.mlp.up_proj.weight"]
 
-                for  param in self.actor.model.parameters():
-                    if param.grad is not None:
-                        print(f"[Rank {dist.get_rank()}] grad mean = {param.grad.mean().item()}")
-                    else:
-                        print(f"[Rank {dist.get_rank()}]  grad is None")
+                # for  param in self.actor.model.parameters():
+                    # if param.grad is not None:
+                        # print(f"[Rank {dist.get_rank()}] grad mean = {param.grad.mean().item()}")
+                    # else:
+                        # print(f"[Rank {dist.get_rank()}]  grad is None")
 
-                check_mem_allocated(dist.get_rank(), 'before optimizer update')
-
-                load_model_to_device(self.actor, torch.cuda.current_device())
-                load_optimizer_to_device(self.actor, torch.cuda.current_device())
-
-                check_mem_allocated(dist.get_rank(), 'after moving optimizer to GPU')
 
                 self.actor.optimizer.step()
                 self.actor.optimizer.zero_grad()
-                load_optimizer_to_device(self.actor, "cpu")
+                # load_optimizer_to_device(self.actor, "cpu")
 
-
-                check_mem_allocated(dist.get_rank(), '---- clearing optimizer to cpu')
+                if dist.get_rank() == 0:
+                    check_mem_allocated(dist.get_rank(), '------ AFTER OPTIMIZER.STEP() -------')
                 # loss = compute_ppo_loss(minibatch_data_list)
                 # then find the ppo loss.
                 # do loss.backward()
@@ -665,6 +701,22 @@ class Trainer:
             # first scatter the data across each ddp group
             # now let's update the slgang model with the trained model
             # takes in actor model, offload it to cpu, and piece by piece update the sglang model
+            load_model_to_device(self.actor, "cpu")
+            load_optimizer_to_device(self.actor, "cpu")  
+            if dist.get_rank() == 0:
+                check_mem_allocated(dist.get_rank(), '------ AFTER COMPLTEING UPDATE STAGE, AND MOVING TO CPU -------')
+
+            if step % self.config.checkpoint_interval == 0:
+
+                # while checkpointing dcp expects tensors to be on compute device 
+                load_model_to_device(self.actor, torch.cuda.current_device())
+                load_optimizer_to_device(self.actor, torch.cuda.current_device())
+                dcp.save(state_dict=get_dcp_model_state_dict(self.actor.model, self.actor.optimizer, train_dataloader, step), checkpoint_id=f"test_folder/{step}")  
+                print('successfully saved the model')
+
+                load_model_to_device(self.actor, "cpu")
+                load_optimizer_to_device(self.actor, "cpu")  
+            step +=1
             self.rollout.update(self.actor.model)
 
 
@@ -783,7 +835,7 @@ class Actor(Worker):
         dist.barrier()
 
         print(f' rank {dist.get_rank()} logits {logits.shape}')
-        print(f' rank {dist.get_rank()} logits {logits[-1][0][:5]}')
+        # print(f' rank {dist.get_rank()} logits {logits[-1][0][:5]}')
 
         # reconstruct action mask from padded_input_ids
 
@@ -807,12 +859,12 @@ class Actor(Worker):
         for idx in range(logprobs.shape[0]):
             # get the logprobs for only the right side of logprobs that is equals to the actions length, cause left side has been padded to match max length
             data_list[idx][f'{log_type}_logprobs'] = logprobs[idx, -len(data_list[idx]['actions']):] # now oldlogprobs and actions will have the same length as actions and action_mask
-            print( len(data_list[idx][f'{log_type}_logprobs']) == len(data_list[idx]['actions']))
+            # print( len(data_list[idx][f'{log_type}_logprobs']) == len(data_list[idx]['actions']))
         # data_list['old_logprobs'] = logprobs * data_list['action_mask']
 
-        if dist.get_rank() == 0:
-            print(f' actual logprobs {data_list[0]['old_logprobs']} ')
-        # remove the cache
+        # if dist.get_rank() == 0:
+        #     print(f' actual logprobs {data_list[0]['old_logprobs']} ')
+        # # remove the cache
         # check_mem_allocated(dist.get_rank(), 'before clearing cache')
         # load_model_to_device(self, "cpu")
         del logits
@@ -863,6 +915,8 @@ class Config:
     updates_per_rollout: int = 3
     max_eps: float = 0.2 
     min_eps: float = 0.2 
+    checkpoint_interval: int = 10
+    resume_steps: int = 0
 #     train_batch_size: int = 64
 #  
 def main():

@@ -392,8 +392,9 @@ def main():
 
     model = prepare_dp_model(model, model_device_mesh)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-6)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-1)
     test_dataset = RLDataset('CohleM/olympiad_small', 4)
+
 
     data_loader = StatefulDataLoader(test_dataset, batch_size = 3, drop_last=True, collate_fn=collate_fn, shuffle=True)
     
@@ -415,6 +416,8 @@ def main():
             print(item)
 
     # ## ----- Load the model from saved dict -------
+
+    print(f'rnak {dist.get_rank() } model lm head BEFORE update {model.lm_head.weight.to_local()[0,:5]}')
 
     torch.manual_seed(42)
     import pickle
@@ -446,7 +449,6 @@ def main():
     # Change this line - use log_softmax instead of softmax
 
     # print(out[0][0][:5])
-    print(f' rank {dist.get_rank()} out shape {out.shape} just out ',out[-1][0][:5], '\n\n')
 
     # find the cross entropy
     log_probs = torch.log_softmax(out, dim=-1)  # More numerically stable
@@ -459,23 +461,21 @@ def main():
         data_list[idx][f'{log_type}_logprobs'] = check_logprobs[idx, -len(data_list[idx]['actions']):] # now oldlogprobs and actions will have the same length as actions and action_mask
         # print( len(data_list[idx][f'{log_type}_logprobs']) == len(data_list[idx]['actions']))
 
-    if dist.get_rank() == 0:
-        print(f' actual logprobs {data_list[0]['old_logprobs']} ')
-
-    loss = check_logprobs.sum()
+    loss = check_logprobs.mean()
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
+    print(f'rnak {dist.get_rank() } model lm head AFTER update {model.lm_head.weight.to_local()[0,:5]}')
     ### ---- save the dcp model ----- 
-    # step = 5 
-    # for idx, data in enumerate(data_loader):
-    #     if idx == 3:
-    #         dcp.save(state_dict=get_dcp_model_state_dict(model,optimizer,data_loader,step), checkpoint_id="test_folder") 
-    #     if idx == 4:
-    #         print(data) 
-    #         break
-    # print('saved the model')
+    step = 5 
+    for idx, data in enumerate(data_loader):
+        if idx == 3:
+            dcp.save(state_dict=get_dcp_model_state_dict(model,optimizer,data_loader,step), checkpoint_id="test_folder") 
+        if idx == 4:
+            print(data) 
+            break
+    print('saved the model')
 
     ### ---- save the dcp model ----- 
     return
