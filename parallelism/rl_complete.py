@@ -627,6 +627,7 @@ class Trainer:
             data_list = broadcast_data_list(data_list, self.actor.device_mesh['TP'])
             
             with torch.no_grad():
+                self.actor.model.eval()
                 data_list = self.actor.compute_logprobs(data_list, log_type='old')
 
             # break
@@ -647,7 +648,8 @@ class Trainer:
 
             if dist.get_rank() == 0:
                 check_mem_allocated(dist.get_rank(), '---- AFTER LOADING TO GPU BEFORE UPDATE STAGE ----')
-
+            
+            self.actor.model.train()
             for update_step, minibatch in enumerate(data_list):
                 # print(f' RANK {dist.get_rank()}-------- STEP: {update_step} ------------')
                 minibatch = self.actor.compute_logprobs(minibatch, log_type="current")
