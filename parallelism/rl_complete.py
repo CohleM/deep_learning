@@ -1,7 +1,9 @@
 
 
 import os
+from collections import defaultdict
 import re
+import wandb
 import random
 import torch
 import asyncio
@@ -351,6 +353,7 @@ class Rollout(Worker):
         self.device_mesh = init_device_mesh("cuda", (dp_size, self.config.tp_size), mesh_dim_names=["DP", "TP"]) # device is on cpu cause we only need this mesh to scatter data (i.e for data parallelism)
         
     async def rollout(self, data):
+        metric = defaultdict(list)
 
         messages,answer = data['messages'], data['answer']
 
@@ -367,11 +370,14 @@ class Rollout(Worker):
         info = response["meta_info"]
         print('completion tokens', info['completion_tokens'])
         print(response['text'])
+
         # response = sample_response
 
         # generate sparse reward
         reward = reward_fn(response['text'], answer) 
         print(f'rank {dist.get_rank()} reawrd gg {reward}')
+
+
 
         messages.append({'role': 'assistant', 'content': response['text']})
 
@@ -379,6 +385,11 @@ class Rollout(Worker):
         states.extend(tokenized_response)
         actions.extend(tokenized_response)
         action_mask.extend([1] * len(tokenized_response))
+        
+        # wandb metrics
+        metric['response_length'] = info['completion_tokens']
+        metric['trajectory_length'] = len(states)
+        metric['reward'] = reward
 
         # sparse reward, only provide to the last token, putting extra -1 here cause later we do states[:-1]
         rewards = (len(states) -1 - 1)*[0] + [reward]
@@ -391,7 +402,7 @@ class Rollout(Worker):
             'actions' : torch.LongTensor(actions[1:])
         }
 
-        return ex, messages
+        return ex, messages, metric
 
     def __call__(self, data_list):
 
@@ -408,14 +419,16 @@ class Rollout(Worker):
         dist.barrier()
 
         if self.device_mesh['TP'].get_local_rank() == 0:
-            data_list, all_messages = map(list,zip(*outputs))
+            data_list, all_messages, metrics = map(list,zip(*outputs))
 
             # gather all the data_list 
             data_list = gather_data_list(data_list, self.device_mesh['DP'])
             # all_messages = gather_data_list(all_messages, self.device_mesh['DP'])
 
         if dist.get_rank() == 0:
-            return data_list
+            return data_list, metrics
+        else:
+            return None, None
 
 
     def prepare_env_var(self):
@@ -566,6 +579,11 @@ class Trainer:
         # construct train dataloader
         step = 0
 
+        # init wandb
+        if dist.get_rank() == 0:
+            wandb.init(project=self.config.project_name, name=self.config.experiment_name, config=self.config)
+
+
         # Load the checkpoint
         if self.config.resume_steps is not None:
             # while loading models and optimizers should be on compute device 
@@ -590,7 +608,7 @@ class Trainer:
 
             # print(f'rank {dist.get_rank()} lenght of data_list {len(data_list)}')
             # let's do the rollout --- turn it back on when doing real rollout ----
-            data_list = self.rollout(data_list) # rank 0 will only have data_list, otherwise it'll be None
+            data_list, metrics = self.rollout(data_list) # rank 0 will only have data_list, otherwise it'll be None
             # let's do the rollout --- turn it back on when doing real rollout ----
 
             check_mem_allocated(dist.get_rank(), 'after completing rollout')
@@ -650,6 +668,8 @@ class Trainer:
                 check_mem_allocated(dist.get_rank(), '---- AFTER LOADING TO GPU BEFORE UPDATE STAGE ----')
             
             self.actor.model.train()
+
+            dp_loss = 0.0
             for update_step, minibatch in enumerate(data_list):
                 # print(f' RANK {dist.get_rank()}-------- STEP: {update_step} ------------')
                 minibatch = self.actor.compute_logprobs(minibatch, log_type="current")
@@ -663,7 +683,7 @@ class Trainer:
                 # thus the multiplication by self.dp_size
                 loss = grpo_loss(minibatch, max_eps=self.config.max_eps, min_eps=self.config.min_eps) * self.actor.dp_size
                 print(f'RANK {dist.get_rank()}-------- STEP: {update_step} ------------ loss: {loss} len_data_list {len(data_list)} ')
-
+                dp_loss = 0.0
                 
                 loss.backward() # when we do this, the gradients are averaged among dp groups.
 
@@ -697,7 +717,18 @@ class Trainer:
             # print(f'trn loop rank {dist.get_rank()} data_list length {len(data_list) if isinstance(data_list, list) else None} mesh {self.actor.device_mesh} datalist: {len(data_list[0])} \n\n' )
             # now lets do the update.
 
+            dp_loss = gather_data_list([dp_loss], self.actor.device_mesh['DP'])
+            dp_loss = sum(dp_loss)/len(dp_loss)
 
+            # Log wandb metrics
+            if dist.get_rank() == 0:
+                # Averaging all the metrics
+                metrics = {k: sum([item[k] for item in metrics])/len(metrics) for k in metrics[0].keys()}
+                metrics['loss'] = dp_loss
+                metrics['step'] = step
+                # wandb.log(metrics)
+                print('METRICS',metrics)
+                wandb.log(metrics)
             # now the main ppo loss
 
             # generate rollouts. each train_batch will have length per_rollout_size x responses_per_prompt
@@ -920,6 +951,8 @@ class Config:
     min_eps: float = 0.2 
     checkpoint_interval: int = 10
     resume_steps: int = None 
+    project_name: str = "rl"
+    experiment_name: str = "test-countdown-qwen-3b"
 #     train_batch_size: int = 64
 #  
 def main():
