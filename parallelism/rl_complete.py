@@ -446,11 +446,12 @@ class Rollout(Worker):
         )
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(cuda_visible_devices)
 
-    def update(self, model):
-        # first offload the model to cpu
+    def update(self, actor):
+        load_model_to_device(actor, torch.cuda.current_device())
+        
         options = StateDictOptions(full_state_dict=False, cpu_offload=True)
         state_dict = get_model_state_dict(
-            model, options=options
+            actor.model, options=options
         )
 
         # resume sglang's memory occupation
@@ -475,7 +476,7 @@ class Rollout(Worker):
 
             
             # print(f"rank {dist.get_rank()} seriliazed_tensor {serialized_tensor.shape} len_ST: {len(serialized_tensors) if isinstance(serialized_tensors,list) else serialized_tensors} ")
-
+        load_model_to_device(actor, 'cpu')
         dist.barrier()
 
 
@@ -683,7 +684,7 @@ class Trainer:
                 # thus the multiplication by self.dp_size
                 loss = grpo_loss(minibatch, max_eps=self.config.max_eps, min_eps=self.config.min_eps) * self.actor.dp_size
                 print(f'RANK {dist.get_rank()}-------- STEP: {update_step} ------------ loss: {loss} len_data_list {len(data_list)} ')
-                dp_loss = 0.0
+                dp_loss += loss.item()
                 
                 loss.backward() # when we do this, the gradients are averaged among dp groups.
 
@@ -718,11 +719,11 @@ class Trainer:
             # now lets do the update.
 
             dp_loss = gather_data_list([dp_loss], self.actor.device_mesh['DP'])
-            dp_loss = sum(dp_loss)/len(dp_loss)
-
+        
             # Log wandb metrics
             if dist.get_rank() == 0:
                 # Averaging all the metrics
+                dp_loss = sum(dp_loss)/len(dp_loss)
                 metrics = {k: sum([item[k] for item in metrics])/len(metrics) for k in metrics[0].keys()}
                 metrics['loss'] = dp_loss
                 metrics['step'] = step
@@ -751,7 +752,7 @@ class Trainer:
                 load_model_to_device(self.actor, "cpu")
                 load_optimizer_to_device(self.actor, "cpu")  
             step +=1
-            self.rollout.update(self.actor.model)
+            self.rollout.update(self.actor)
 
 
 def reward_fn(predicted_answer, actual_answer):
