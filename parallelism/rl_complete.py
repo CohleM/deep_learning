@@ -10,6 +10,7 @@ import asyncio
 import pickle
 import time
 import gc
+from math_verify import parse, verify
 from qwen_monkey_patch import apply_qwen_patches
 from dataclasses import dataclass
 from torch import distributed as dist
@@ -119,7 +120,8 @@ class RLDataset(Dataset):
 
         ex = self.dataset[idx]
         messages = ex["messages"]
-        answer = ex["answer"]
+        # answer = ex["answer"]
+        answer = ex["target"]
 
         return {
             "messages": messages,
@@ -356,9 +358,12 @@ class Rollout(Worker):
         metric = defaultdict(list)
 
         messages,answer = data['messages'], data['answer']
-
-        prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        states = self.tokenizer.encode(prompt)
+        if not self.config.apply_chat_template:
+            prompt = data['messages'] 
+            states = self.tokenizer.encode(prompt)
+        else:
+            prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            states = self.tokenizer.encode(prompt)
         actions = [0] * len(states)
         action_mask = [0] * len(states)
 
@@ -369,7 +374,7 @@ class Rollout(Worker):
         
         info = response["meta_info"]
         print('completion tokens', info['completion_tokens'])
-        print(response['text'])
+        # print(response['text'])
 
         # response = sample_response
 
@@ -378,9 +383,12 @@ class Rollout(Worker):
         print(f'rank {dist.get_rank()} reawrd gg {reward}')
 
 
-
-        messages.append({'role': 'assistant', 'content': response['text']})
-
+        if not self.config.apply_chat_template:
+            messages += response['text']
+            print('messages', messages)
+        else:
+            messages.append({'role': 'assistant', 'content': response['text']})
+        
         tokenized_response = self.tokenizer.encode(response['text'])
         states.extend(tokenized_response)
         actions.extend(tokenized_response)
@@ -683,7 +691,7 @@ class Trainer:
                 # see how averaging is only done when sequences belong to the same batch, here in this RL step they do not, so we need to cancel out the auto-averaging.
                 # thus the multiplication by self.dp_size
                 loss = grpo_loss(minibatch, max_eps=self.config.max_eps, min_eps=self.config.min_eps) * self.actor.dp_size
-                print(f'RANK {dist.get_rank()}-------- STEP: {update_step} ------------ loss: {loss} len_data_list {len(data_list)} ')
+                print(f'RANK {dist.get_rank()}-------- STEP: {update_step} ------------ loss: {loss} len minibatch {len(minibatch)} ')
                 dp_loss += loss.item()
                 
                 loss.backward() # when we do this, the gradients are averaged among dp groups.
@@ -699,6 +707,8 @@ class Trainer:
                         # print(f"[Rank {dist.get_rank()}]  grad is None")
 
                 torch.nn.utils.clip_grad_norm_(self.actor.model.parameters(), max_norm=1.0)
+                if dist.get_rank() == 0:
+                    check_mem_allocated(dist.get_rank(), '------ EXACTLY BEFORE OPTIMIZER.STEP() -------')
                 self.actor.optimizer.step()
                 self.actor.optimizer.zero_grad()
                 # load_optimizer_to_device(self.actor, "cpu")
@@ -755,15 +765,26 @@ class Trainer:
             self.rollout.update(self.actor)
 
 
-def reward_fn(predicted_answer, actual_answer):
-    # use regex to scrape the answer from \\boxed{answer}
-    m = re.search(r'\\boxed\{([^}]*)\}', predicted_answer)
-    answer = m.group(1).strip() if m else None
-    if answer == actual_answer.strip():
-        return 1.0
-    else:
-        return 0.0
+# def reward_fn(predicted_answer, actual_answer):
+    
+#     # use regex to scrape the answer from \\boxed{answer}
+#     m = re.search(r'\\boxed\{([^}]*)\}', predicted_answer)
+#     answer = m.group(1).strip() if m else None
+#     if answer == str(actual_answer).strip():
+#         return 1.0
+#     else:
+#         return 0.0
 
+def reward_fn(output, ground_truth_ans): 
+    reward = 0.0
+    answer_match = re.search(r"<answer>(.*?)</answer>", output, flags=re.DOTALL)
+    answer = answer_match.group(1).strip() if answer_match else None
+
+    result = verify(parse(answer), parse(str(ground_truth_ans)))
+    reward += 1.0 if result else 0.01
+    reward += 0.20 if re.search(r"<think>.*?</think>", output, flags=re.DOTALL) else 0.0
+
+    return reward
 
 def grpo_advantage(data_list, responses_per_prompt):
   rewards = torch.tensor([ex['rewards'].sum() for ex in data_list]).view(-1, responses_per_prompt)
@@ -866,7 +887,7 @@ class Actor(Worker):
         # logits = self.model(input_ids=test_input_ids,attention_mask=attention_mask, position_ids=position_ids , use_cache=False).logits
         # print('this is logits shape', logits.shape)
 
-        logits = self.model(input_ids=padded_input_ids['input_ids'], attention_mask=attention_mask, position_ids=position_ids).logits
+        logits = self.model(input_ids=padded_input_ids['input_ids'], attention_mask=attention_mask, position_ids=position_ids, use_cache=False).logits
         dist.barrier()
 
         print(f' rank {dist.get_rank()} logits {logits.shape}')
@@ -939,23 +960,26 @@ def start():
 class Config:
     temperature: float = 1.0
     train_batch_size: int = 64
-    model_name: str = 'Qwen/Qwen2.5-0.5B-Instruct'
+    # model_name: str = 'Qwen/Qwen2.5-0.5B-Instruct'
+    model_name: str = 'Qwen/Qwen2.5-3B'
     ddp_size: int = 1 
     tp_size: int = 2 
     lr: float = 1e-6
-    data_path: str = 'CohleM/olympiad_small'
-    responses_per_prompt: int = 2 
-    per_rollout_size: int = 3
+    # data_path: str = 'CohleM/olympiad_small'
+    data_path: str = 'Majis699/countdown'
+    responses_per_prompt: int = 8
+    per_rollout_size: int = 16 
     offload_model: bool = True
-    updates_per_rollout: int = 3
+    updates_per_rollout: int = 4 
     max_eps: float = 0.2 
     min_eps: float = 0.2 
-    checkpoint_interval: int = 10
-    resume_steps: int = None 
+    checkpoint_interval: int = 20
+    resume_steps: int = None
     project_name: str = "rl"
     experiment_name: str = "test-countdown-qwen-3b"
+    # apply_chat_template: str = True # if using False, use base model, else Instruct model
+    apply_chat_template: str = False # if using False, use base model, else Instruct model
 #     train_batch_size: int = 64
-#  
 def main():
     # setup process groups.
     setup()
