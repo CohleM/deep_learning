@@ -395,7 +395,7 @@ class Rollout(Worker):
         action_mask.extend([1] * len(tokenized_response))
         
         # wandb metrics
-        metric['response_length'] = info['completion_tokens']
+        metric['response_length'] = sum(action_mask) 
         metric['trajectory_length'] = len(states)
         metric['reward'] = reward
 
@@ -652,7 +652,10 @@ class Trainer:
             
             # for tp groups data must be same, so make same data
             data_list = broadcast_data_list(data_list, self.actor.device_mesh['TP'])
-            
+
+            if dist.get_rank() == 0:
+                check_mem_allocated(dist.get_rank(), '---- BEFORE FIRST COMPUTE LOGPROBS----')
+
             with torch.no_grad():
                 self.actor.model.eval()
                 data_list = self.actor.compute_logprobs(data_list, log_type='old')
@@ -668,18 +671,20 @@ class Trainer:
             data_list = [data_list[i*mini_batch_size: (i+1)*mini_batch_size] for i in range(self.config.updates_per_rollout)]
 
             if dist.get_rank() == 0:
-                check_mem_allocated(dist.get_rank(), '---- BEFORE UPDATE STAGE ----')
+                check_mem_allocated(dist.get_rank(), '---- BEFORE UPDATE STAGE Before loading model and optim to gpu ----')
 
             load_model_to_device(self.actor, torch.cuda.current_device())
-            load_optimizer_to_device(self.actor, torch.cuda.current_device()) 
+            # load_optimizer_to_device(self.actor, torch.cuda.current_device()) 
 
             if dist.get_rank() == 0:
-                check_mem_allocated(dist.get_rank(), '---- AFTER LOADING TO GPU BEFORE UPDATE STAGE ----')
+                check_mem_allocated(dist.get_rank(), '---- AFTER LOADING Model and Optimizer TO GPU BEFORE UPDATE STAGE ----')
             
             self.actor.model.train()
 
             dp_loss = 0.0
             for update_step, minibatch in enumerate(data_list):
+
+                start_time = time.time()
                 # print(f' RANK {dist.get_rank()}-------- STEP: {update_step} ------------')
                 minibatch = self.actor.compute_logprobs(minibatch, log_type="current")
 
@@ -693,7 +698,11 @@ class Trainer:
                 loss = grpo_loss(minibatch, max_eps=self.config.max_eps, min_eps=self.config.min_eps) * self.actor.dp_size
                 print(f'RANK {dist.get_rank()}-------- STEP: {update_step} ------------ loss: {loss} len minibatch {len(minibatch)} ')
                 dp_loss += loss.item()
+
+                if dist.get_rank() == 0:
+                    check_mem_allocated(dist.get_rank(), '------  After compute logprobs -------')
                 
+                torch.cuda.empty_cache()
                 loss.backward() # when we do this, the gradients are averaged among dp groups.
 
 
@@ -707,14 +716,26 @@ class Trainer:
                         # print(f"[Rank {dist.get_rank()}]  grad is None")
 
                 torch.nn.utils.clip_grad_norm_(self.actor.model.parameters(), max_norm=1.0)
+
+                gc.collect() 
+                torch.cuda.empty_cache()
+
                 if dist.get_rank() == 0:
                     check_mem_allocated(dist.get_rank(), '------ EXACTLY BEFORE OPTIMIZER.STEP() -------')
+
+
+                
+                load_optimizer_to_device(self.actor, torch.cuda.current_device())
                 self.actor.optimizer.step()
-                self.actor.optimizer.zero_grad()
+                self.actor.optimizer.zero_grad(set_to_none=True)
                 # load_optimizer_to_device(self.actor, "cpu")
 
                 if dist.get_rank() == 0:
                     check_mem_allocated(dist.get_rank(), '------ AFTER OPTIMIZER.STEP() -------')
+
+                
+                end_time = time.time() 
+                print('----- UPDATE TIME ---- ', end_time - start_time)
                 # loss = compute_ppo_loss(minibatch_data_list)
                 # then find the ppo loss.
                 # do loss.backward()
@@ -729,7 +750,6 @@ class Trainer:
             # now lets do the update.
 
             dp_loss = gather_data_list([dp_loss], self.actor.device_mesh['DP'])
-        
             # Log wandb metrics
             if dist.get_rank() == 0:
                 # Averaging all the metrics
@@ -739,6 +759,7 @@ class Trainer:
                 metrics['step'] = step
                 # wandb.log(metrics)
                 print('METRICS',metrics)
+                
                 wandb.log(metrics)
             # now the main ppo loss
 
@@ -945,7 +966,9 @@ def load_optimizer_to_device(worker, device):
                     state[key] = value.to(
                         device, non_blocking=True
                     )
-
+                    if device=='cpu':
+                        gc.collect()
+                        torch.cuda.empty_cache()
 
 def start():
     # nest_asyncio.apply()
@@ -967,7 +990,7 @@ class Config:
     lr: float = 1e-6
     # data_path: str = 'CohleM/olympiad_small'
     data_path: str = 'Majis699/countdown'
-    responses_per_prompt: int = 8
+    responses_per_prompt: int = 6 
     per_rollout_size: int = 16 
     offload_model: bool = True
     updates_per_rollout: int = 4 
