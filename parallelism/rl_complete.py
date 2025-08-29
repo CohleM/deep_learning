@@ -373,19 +373,19 @@ class Rollout(Worker):
             )
         
         info = response["meta_info"]
-        print('completion tokens', info['completion_tokens'])
+        # print('completion tokens', info['completion_tokens'])
         # print(response['text'])
 
         # response = sample_response
 
         # generate sparse reward
         reward = reward_fn(response['text'], answer) 
-        print(f'rank {dist.get_rank()} reawrd gg {reward}')
+        # print(f'rank {dist.get_rank()} reawrd gg {reward}')
 
 
         if not self.config.apply_chat_template:
             messages += response['text']
-            print('messages', messages)
+            # print('messages', messages)
         else:
             messages.append({'role': 'assistant', 'content': response['text']})
         
@@ -434,9 +434,9 @@ class Rollout(Worker):
             # all_messages = gather_data_list(all_messages, self.device_mesh['DP'])
 
         if dist.get_rank() == 0:
-            return data_list, metrics
+            return data_list,all_messages, metrics
         else:
-            return None, None
+            return None, None, None
 
 
     def prepare_env_var(self):
@@ -611,13 +611,17 @@ class Trainer:
             load_optimizer_to_device(self.actor, 'cpu') 
         
         for train_idx, data_list in enumerate(train_dataloader):
-            
+
+            trn_start = time.time() 
             if dist.get_rank() == 0:
                 print(f' ----------------- TRAIN IDX {train_idx} ------------------') 
 
             # print(f'rank {dist.get_rank()} lenght of data_list {len(data_list)}')
             # let's do the rollout --- turn it back on when doing real rollout ----
-            data_list, metrics = self.rollout(data_list) # rank 0 will only have data_list, otherwise it'll be None
+
+            rollout_start = time.time()
+            data_list, all_messages , metrics = self.rollout(data_list) # rank 0 will only have data_list, otherwise it'll be None
+            rollout_end = time.time() 
             # let's do the rollout --- turn it back on when doing real rollout ----
 
             check_mem_allocated(dist.get_rank(), 'after completing rollout')
@@ -682,9 +686,10 @@ class Trainer:
             self.actor.model.train()
 
             dp_loss = 0.0
+            grad_start = time.time()
             for update_step, minibatch in enumerate(data_list):
-
-                start_time = time.time()
+                
+                
                 # print(f' RANK {dist.get_rank()}-------- STEP: {update_step} ------------')
                 minibatch = self.actor.compute_logprobs(minibatch, log_type="current")
 
@@ -696,7 +701,7 @@ class Trainer:
                 # see how averaging is only done when sequences belong to the same batch, here in this RL step they do not, so we need to cancel out the auto-averaging.
                 # thus the multiplication by self.dp_size
                 loss = grpo_loss(minibatch, max_eps=self.config.max_eps, min_eps=self.config.min_eps) * self.actor.dp_size
-                print(f'RANK {dist.get_rank()}-------- STEP: {update_step} ------------ loss: {loss} len minibatch {len(minibatch)} ')
+                # print(f'RANK {dist.get_rank()}-------- STEP: {update_step} ------------ loss: {loss} len minibatch {len(minibatch)} ')
                 dp_loss += loss.item()
 
                 if dist.get_rank() == 0:
@@ -734,13 +739,13 @@ class Trainer:
                     check_mem_allocated(dist.get_rank(), '------ AFTER OPTIMIZER.STEP() -------')
 
                 
-                end_time = time.time() 
-                print('----- UPDATE TIME ---- ', end_time - start_time)
                 # loss = compute_ppo_loss(minibatch_data_list)
                 # then find the ppo loss.
                 # do loss.backward()
                 # then do optimizer.step()
                 # self.actor.optimizer.step()
+
+
 
             ## ------- actor update section -------
 
@@ -750,6 +755,8 @@ class Trainer:
             # now lets do the update.
 
             dp_loss = gather_data_list([dp_loss], self.actor.device_mesh['DP'])
+
+            grad_end = time.time() 
             # Log wandb metrics
             if dist.get_rank() == 0:
                 # Averaging all the metrics
@@ -758,7 +765,10 @@ class Trainer:
                 metrics['loss'] = dp_loss
                 metrics['step'] = step
                 # wandb.log(metrics)
-                print('METRICS',metrics)
+                print('--------------- METRICS--------------- ',metrics)
+                print('--------------- ROLLOUT TIME --------------- ', rollout_end - rollout_start)
+                print('--------------- GRADIENT STEP TIME --------------- ', grad_end - grad_start)
+
                 
                 wandb.log(metrics)
             # now the main ppo loss
@@ -784,6 +794,19 @@ class Trainer:
                 load_optimizer_to_device(self.actor, "cpu")  
             step +=1
             self.rollout.update(self.actor)
+
+            trn_end = time.time()
+            if dist.get_rank() == 0:
+                print('------------ ONE COMPLETE STEP TIME : ------------ ', trn_end - trn_start)
+                if train_idx % 5 == 0:
+                    print(all_messages[-10:])
+
+                    with open('all_messages.txt', 'w') as f:
+                        for item in all_messages:
+                            f.write(f"--------------\n{item}\n")
+
+                
+
 
 
 # def reward_fn(predicted_answer, actual_answer):
@@ -822,7 +845,7 @@ def grpo_advantage(data_list, responses_per_prompt):
 
 def check_mem_allocated(rank, msg):
     ans = torch.cuda.memory_allocated() / (1024**3)
-    print(f'RANK {rank} MEMORY_ALLOCATED {msg} {ans}')
+    # print(f'RANK {rank} MEMORY_ALLOCATED {msg} {ans}')
 
 
 import torch
@@ -871,14 +894,14 @@ class Actor(Worker):
         # let's first split the data_list again across groups
 
         # print(f'RANK {dist.get_rank()} len data_list , {len(data_list) if isinstance(data_list, list) else None} first element {data_list[0] if isinstance(data_list, list) else None}')
-        print(f'RANK {dist.get_rank()} len data_list , {len(data_list) if isinstance(data_list, list) else None} ')
+        # print(f'RANK {dist.get_rank()} len data_list , {len(data_list) if isinstance(data_list, list) else None} ')
 
 
         # recplicate the data across tp dimension cause they need the same data 
        
         # load the model back to gpu, previously the sharded model was stored in the CPU with it's reference contained in self.model
         load_model_to_device(self, torch.cuda.current_device())
-        print('loaded model to device')
+        # print('loaded model to device')
 
         input_ids = [item['states'] for item in data_list]
         action_input_ids = [item['actions'] for item in data_list]
@@ -911,7 +934,7 @@ class Actor(Worker):
         logits = self.model(input_ids=padded_input_ids['input_ids'], attention_mask=attention_mask, position_ids=position_ids, use_cache=False).logits
         dist.barrier()
 
-        print(f' rank {dist.get_rank()} logits {logits.shape}')
+        # print(f' rank {dist.get_rank()} logits {logits.shape}')
         # print(f' rank {dist.get_rank()} logits {logits[-1][0][:5]}')
 
         # reconstruct action mask from padded_input_ids
